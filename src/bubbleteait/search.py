@@ -48,6 +48,8 @@ def _bytes(path: Path, expected_hash: str | None = None) -> tuple[bytes, str]:
         raise SearchError(f"Source file is unavailable: {path}") from exc
     if (before.st_size, before.st_mtime_ns, before.st_ino) != (after.st_size, after.st_mtime_ns, after.st_ino):
         raise SearchError("Source changed while it was being read; retry")
+    if len(content) != after.st_size:
+        raise SearchError("Source size changed while it was being read; retry")
     digest = hashlib.sha256(content).hexdigest()
     if expected_hash is not None and digest != expected_hash:
         raise SearchError("Snapshot source hash does not match its manifest")
@@ -96,7 +98,7 @@ class SearchService:
         refs = composition.get("units")
         if not isinstance(refs, list) or not refs:
             raise SearchError("Composition must contain a nonempty unit array")
-        seen_units, seen_sources = set(), set()
+        seen_units, seen_sources, units_by_source = set(), set(), {}
         for reference in refs:
             if not isinstance(reference, dict) or not {"unit_id", "source_id", "recipe_hash", "index_status"} <= reference.keys():
                 raise SearchError("Invalid composition unit reference")
@@ -107,8 +109,21 @@ class SearchService:
                 raise SearchError("Composition mixes duplicate units or logical source versions")
             seen_units.add(reference["unit_id"])
             seen_sources.add(reference["source_id"])
+            units_by_source[reference["source_id"]] = manifest
             if reference["index_status"] != "ready" or self.registry.index_status(reference["unit_id"])["status"] != "ready":
                 raise SearchError("Composition index is no longer ready")
+        # A composition is data. Its working-read root must identify the same
+        # source directory as the immutable unit, not an arbitrary path.
+        for source_id, root in roots.items():
+            unit = units_by_source.get(source_id) if isinstance(source_id, str) else None
+            provenance = unit.get("provenance", {}).get("source_root") if unit else None
+            try:
+                matches = bool(unit and isinstance(provenance, str)
+                               and Path(root).resolve() == Path(provenance).resolve())
+            except OSError:
+                matches = False
+            if not matches:
+                raise SearchError("configuration.source_roots does not match the registered source: " + str(source_id))
         fingerprint = _digest({"units": [{"unit_id": ref["unit_id"], "recipe_hash": ref["recipe_hash"]} for ref in refs], "configuration_hash": composition["configuration_hash"]})
         if composition.get("composition_hash") != fingerprint:
             raise SearchError("Composition fingerprint does not match its unit references")
@@ -135,10 +150,12 @@ class SearchService:
             raise SearchError("Backend result has invalid source coordinates")
         excerpt = "".join(lines[start - 1:end]).replace("\r\n", "\n")
         candidate = row["content"].replace("\r\n", "\n")
-        if not candidate.strip() or candidate.strip() not in excerpt.strip():
+        # The backend row must be the exact source slice, not merely a
+        # substring of it. Otherwise a row could cite lines it never returned.
+        if not candidate.strip() or not (candidate == excerpt or candidate + "\n" == excerpt or candidate == excerpt + "\n"):
             raise SearchError("Backend result content does not match source coordinates")
         return {
-            **row, "unit_id": manifest["unit_id"], "source_id": manifest["source_id"],
+            **row, "content": excerpt, "unit_id": manifest["unit_id"], "source_id": manifest["source_id"],
             "source_sha256": entry["sha256"], "recipe_hash": manifest["recipe_hash"],
             "role": manifest["role"], "kind": manifest["kind"],
             "provenance": manifest["provenance"], "unit_rank": rank,

@@ -391,7 +391,10 @@ class _IgnorePolicy:
         for name, is_directory in names:
             relative = (directory / name).relative_to(worktree).as_posix()
             paths[relative + ("/" if is_directory else "")] = name
-        response = self._run(command, "check-ignore", "--no-index", "-z", "--stdin",
+        # Do not pass --no-index: Git must treat an already tracked file as
+        # included even if a broad ignore rule matches it. The previous flag
+        # silently dropped committed generated/vendor files from the corpus.
+        response = self._run(command, "check-ignore", "-z", "--stdin",
                              input=b"\0".join(os.fsencode(path) for path in paths) + b"\0")
         if response.returncode not in (0, 1):
             raise RegistryError("Git ignore check failed: " + response.stderr.decode("utf-8", "replace").strip())
@@ -431,9 +434,13 @@ class Registry:
         self._check_source_boundary(spec)
         value = asdict(spec)
         value["root"] = str(spec.root)
-        registry = self._sources()
-        registry["sources"][spec.source_id] = value
-        _atomic_json(self.sources_file, registry)
+        from .qwen_runtime import file_lock
+        # register() is a read-modify-write of one JSON file. Service sync and
+        # a concurrent CLI `source add` must not lose each other's entries.
+        with file_lock(self.data_dir / 'metadata/registry.lock'):
+            registry = self._sources()
+            registry["sources"][spec.source_id] = value
+            _atomic_json(self.sources_file, registry)
         return value
 
     def list_sources(self) -> list[dict]:
@@ -643,9 +650,9 @@ class Registry:
             raise RegistryError("Snapshot unit identity does not match manifest")
         return manifest
 
-    def index_status(self, unit_id: str) -> dict:
+    def index_status(self, unit_id: str, *, verify_sources: bool = True) -> dict:
         """Validate a backend status record against the immutable source recipe."""
-        manifest = self.load_unit(unit_id)
+        manifest = self.load_unit(unit_id, verify_files=verify_sources)
         path = self.data_dir / "indexes" / unit_id / "status.json"
         if not path.exists():
             return {"unit_id": unit_id, "status": "missing", "recipe_hash": manifest["recipe_hash"]}
@@ -670,6 +677,11 @@ class Registry:
             raise RegistryError("Composition needs a nonempty array of unit IDs")
         if len(set(unit_ids)) != len(unit_ids):
             raise RegistryError("Composition contains duplicate unit IDs")
+        from .qwen_runtime import file_lock
+        with file_lock(self.data_dir / 'metadata/registry.lock'):
+            return self._compose(composition_id, unit_ids, configuration=configuration, require_ready=require_ready)
+
+    def _compose(self, composition_id, unit_ids, *, configuration=None, require_ready=False):
         units = [self.load_unit(unit_id) for unit_id in unit_ids]
         source_ids = [unit["source_id"] for unit in units]
         if len(set(source_ids)) != len(source_ids):

@@ -182,6 +182,13 @@ def build_server(config: Config, *, workspace: str | None = None):
         if not requests:
             raise ConfigError('requests must contain 1..20 reads')
         normalized = [request.model_dump(exclude_none=True) if isinstance(request, BaseModel) else request for request in requests]
+        def issued(request):
+            return isinstance(request, str) or isinstance(request, dict) and set(request) == {'id'}
+        # Mixing an issued ID with a path would resolve the path in the old
+        # preferred composition selected by the ID. Require an explicit pin.
+        if composition_id is None and any(issued(request) for request in normalized) \
+                and not all(issued(request) for request in normalized):
+            raise ConfigError('Do not mix issued evidence IDs and path requests; pass composition_id explicitly')
         identifiers = [r if isinstance(r, str) else r.get('id') for r in normalized]
         if (composition_id is None and all(identifier in session.ledger for identifier in identifiers)
                 and len({session.ledger[i][0].composition_id for i in identifiers}) > 1):

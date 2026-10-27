@@ -22,7 +22,7 @@ import weakref
 
 from .config import Config, ConfigError, ModelConfig, CocoIndexConfig, QwenConfig, SymbolsConfig, load_config
 from .project import load_project, project_info, sync_project
-from .registry import _atomic_json, _digest, _matches, _IgnorePolicy
+from .registry import Registry, _atomic_json, _digest, _matches, _IgnorePolicy
 from .qwen_runtime import file_lock, NoRedirect
 
 
@@ -143,6 +143,7 @@ class Coordinator:
         self.config_error = None
         self.last_discovery = 0.0
         self.last_config_bytes = None
+        self.service_candidate = self._service_candidate(config)
         self.profile_override = config.embedding_override
         self.sync_overrides = dict(config.sync_overrides)
         self.thread = None
@@ -166,6 +167,17 @@ class Coordinator:
                 'next_check': 0.0, 'last_checked_at': None, 'sources': [], 'config_hash': None}
         return self.entries[key]
 
+    @staticmethod
+    def _service_candidate(config):
+        if config.service_file is not None:
+            return config.service_file
+        # A legacy user config keeps working; if the machine config appears
+        # next to it later, the coordinator starts using it without a restart.
+        for path in config.loaded_files:
+            if path.name == 'config.toml':
+                return path.with_name('config-service.toml')
+        return None
+
     def _save(self):
         _atomic_json(self.registrations, {'manual': [e['path'] for e in self.entries.values() if e['manual']]})
 
@@ -188,17 +200,23 @@ class Coordinator:
                 e['workspaces'].append(workspace)
             if lease:
                 e['leases'][lease] = time.monotonic() + 120
-            if e['composition_id'] is None:
-                runtime = replace(self.config, project_dir=root, project_config=root / 'bti.toml')
-                try:
-                    info = project_info(runtime)
-                    if info.get('ready'):
-                        from .search import SearchService
-                        pinned = SearchService(runtime.data_dir).load_composition(info['composition_id'])
-                        e.update(composition_id=info['composition_id'], composition_hash=info['composition_hash'],
-                                 config_hash=pinned['configuration'].get('bti', {}).get('config_hash'))
-                except ValueError:
-                    pass  # A missing/unready previous generation is built by reconcile.
+            needs_composition = e['composition_id'] is None
+        # Verification reads the whole snapshot and must not hold the global
+        # condition lock: status/heartbeat of other clients would stall behind it.
+        if needs_composition:
+            runtime = replace(self.config, project_dir=root, project_config=root / 'bti.toml')
+            try:
+                info = project_info(runtime)
+                if info.get('ready'):
+                    from .search import SearchService
+                    pinned = SearchService(runtime.data_dir).load_composition(info['composition_id'])
+                    with self.cv:
+                        if e['composition_id'] is None:
+                            e.update(composition_id=info['composition_id'], composition_hash=info['composition_hash'],
+                                     config_hash=pinned['configuration'].get('bti', {}).get('config_hash'))
+            except ValueError:
+                pass  # A missing/unready previous generation is built by reconcile.
+        with self.cv:
             if manual:
                 self._save()
             self.cv.notify_all()
@@ -219,10 +237,13 @@ class Coordinator:
                 e['leases'].pop(lease, None)
 
     def heartbeat(self, lease):
+        found = False
         with self.cv:
             for e in self.entries.values():
                 if lease in e['leases']:
                     e['leases'][lease] = time.monotonic() + 120
+                    found = True
+        return found
 
     def _public(self, entry):
         keys = ('path', 'project', 'manual', 'workspaces', 'state', 'error', 'composition_id',
@@ -260,13 +281,16 @@ class Coordinator:
         return {'projects': projects, 'errors': errors}
 
     def refresh_settings(self):
-        filename = self.config.service_file
-        if filename is None:
+        filename = self.config.service_file or self.service_candidate
+        if filename is None or not filename.exists():
             return
         try:
             content = filename.read_bytes()
             if content == self.last_config_bytes:
                 return
+            # Record the attempted revision before parsing: a broken file must
+            # not be re-read and re-parsed on every 250 ms coordinator tick.
+            self.last_config_bytes = content
             updated = load_config(self.config.project_dir, config_path=filename)
             if updated.data_dir != self.config.data_dir:
                 raise ConfigError('Changing service data_dir requires restarting the service')
@@ -276,13 +300,14 @@ class Coordinator:
                 self.config = select_profile(updated, override)
                 self.config = replace(self.config, sync=self.config.sync | self.sync_overrides,
                                        sync_overrides=self.sync_overrides)
-                self.last_config_bytes = content
+                self.service_candidate = filename
                 self.config_error = None
                 self.last_discovery = 0
                 for e in self.entries.values():
                     e['next_check'] = 0
         except (OSError, ValueError) as exc:
-            self.config_error = str(exc)
+            with self.cv:
+                self.config_error = str(exc)
 
     def refresh_workspaces(self):
         memberships = {}
@@ -312,6 +337,53 @@ class Coordinator:
                 e['workspaces'] = memberships.get(key, [])
         self.last_discovery = time.monotonic()
 
+    def _composition_ready(self, composition_id):
+        """Cheap readiness check: status files only, no source-byte verification."""
+        if not composition_id:
+            return False
+        try:
+            path = self.config.data_dir / 'metadata/compositions' / f'{composition_id}.json'
+            composition = json.loads(path.read_text(encoding='utf-8'))
+            if composition.get('ready') is not True or composition.get('composition_id') != composition_id:
+                return False
+            registry = Registry(self.config.data_dir)
+            for reference in composition['units']:
+                if registry.index_status(reference['unit_id'], verify_sources=False)['status'] != 'ready':
+                    return False
+            return True
+        except (OSError, ValueError, KeyError, TypeError):
+            return False
+
+    def _confirm_unchanged(self, key, target):
+        """Confirm a queued revision without waiting for another project's build.
+
+        The full check is intentionally serialized, but a waiter for an
+        unchanged project must not time out because a different project is
+        indexing. This path only hashes the current selection and republishes
+        the already pinned composition.
+        """
+        from .cli import _recipe
+        try:
+            config = replace(self.config, project_dir=Path(key), project_config=Path(key) / 'bti.toml')
+            project = load_project(config.project_config)
+            plan = project.plan(config.data_dir)
+            if not plan['ready']:
+                return False
+            recipe = (self.recipe_factory or _recipe)(config)
+            fingerprint = _digest({'config': project.config_hash, 'recipe': asdict(recipe),
+                                   'files': [s['files'] for s in plan['sources']]})
+        except (OSError, ValueError):
+            return False
+        with self.cv:
+            e = self.entries.get(key)
+            if e is None or fingerprint != e['fingerprint'] or not self._composition_ready(e['composition_id']):
+                return False
+            e.update(state='ready', error=None, last_checked_at=now(),
+                     published_revision=max(e['published_revision'], target), pending=None,
+                     next_check=time.monotonic() + self.config.sync.get('poll_interval_seconds', 1))
+            self.cv.notify_all()
+            return True
+
     def check(self, key, *, force=False):
         """Run one serialized reconcile. Injectable factories allow model-free behavioral tests."""
         from .application import make_backend
@@ -338,7 +410,7 @@ class Coordinator:
             with self.cv:
                 e['last_checked_at'] = now()
                 e['sources'] = [s.source_id for s in project.sources]
-                if fingerprint == e['fingerprint']:
+                if fingerprint == e['fingerprint'] and self._composition_ready(e['composition_id']):
                     e.update(state='ready', error=None, published_revision=revision,
                              next_check=moment + config.sync.get('poll_interval_seconds', 1),
                              pending=None)
@@ -371,6 +443,7 @@ class Coordinator:
             raise ConfigError('Invalid freshness or timeout_ms (0..60000)')
         self.register(path, lease=lease)
         key = str(Path(path).resolve())
+        target = manual_target = None
         with self.cv:
             e = self.entries[key]
             if manual_sync:
@@ -378,6 +451,7 @@ class Coordinator:
                 e['next_check'] = 0
                 if freshness != 'wait':
                     e['requested_revision'] += 1
+                    manual_target = e['requested_revision']
                 self.cv.notify_all()
             if not self.config.sync.get('enabled', True) and not manual_sync and freshness == 'wait':
                 return {'state': 'sync_disabled', 'sync': self._public(e)}
@@ -386,6 +460,15 @@ class Coordinator:
                 target = e['requested_revision']
                 e['next_check'] = 0
                 self.cv.notify_all()
+        # This hashes the current selection, so it must run without the global
+        # condition lock. Otherwise a waiter for project B would block every
+        # status/heartbeat while project A is indexing.
+        confirm_target = target if target is not None else manual_target
+        if confirm_target is not None:
+            self._confirm_unchanged(key, confirm_target)
+        if target is not None:
+            with self.cv:
+                e = self.entries[key]
                 deadline = time.monotonic() + timeout_ms / 1000
                 while e['published_revision'] < target and not self.stop.is_set():
                     if e['state'] == 'error' and e['next_check'] > time.monotonic():
@@ -398,6 +481,12 @@ class Coordinator:
                     self.cv.wait(min(remaining, .25))
                 if e['published_revision'] < target:
                     return {'state': 'error' if e['state'] == 'error' else 'updating', 'sync': self._public(e)}
+        with self.cv:
+            e = self.entries[key]
+            # A manual sync without wait is queued, not complete: never report the
+            # previous composition as a successful synchronization.
+            if manual_target is not None and e['published_revision'] < manual_target:
+                return {'state': 'error' if e['state'] == 'error' else 'updating', 'sync': self._public(e)}
             info = self._public(e)
             # Config boundary edits cannot silently keep excluded sources in implicit results.
             current_hash = load_project(Path(key) / 'bti.toml').config_hash
@@ -444,18 +533,32 @@ class ServiceClient:
         self.state_path = self.directory / 'state.json'
         self.lease = secrets.token_hex(16)
         self.spawned = None
+        self.last_path = None
         self._heartbeat_stop = threading.Event()
         self._heartbeat_thread = None
+
+    def _quarantine_state(self):
+        target = self.state_path.with_name(f'state.invalid-{os.getpid()}-{int(time.time())}.json')
+        try:
+            os.replace(self.state_path, target)
+        except OSError:
+            pass
 
     def state(self):
         try:
             value = json.loads(self.state_path.read_text(encoding='utf-8'))
         except FileNotFoundError:
             return None
-        if (type(value.get('port')) is not int or not 1 <= value['port'] <= 65535
+        except (OSError, ValueError):
+            # A truncated/foreign state must degrade to "stopped", not break
+            # status/ensure with JSONDecodeError on every call.
+            self._quarantine_state()
+            return None
+        if (not isinstance(value, dict) or type(value.get('port')) is not int or not 1 <= value['port'] <= 65535
                 or not isinstance(value.get('token'), str) or len(value['token']) != 64
                 or value.get('data_dir') != str(self.config.data_dir.resolve())):
-            raise ConfigError('Invalid BTI service state')
+            self._quarantine_state()
+            return None
         return value
 
     def _call(self, state, action, payload):
@@ -483,20 +586,26 @@ class ServiceClient:
         with file_lock(self.directory / 'startup.lock', 30):
             if self.probe():
                 return
-            with file_lock(self.directory / 'service.lock'):
+            # Wait for a stopping worker to release the writer lock. A zero
+            # timeout here made an immediate restart fail with a misleading
+            # "busy" error while the previous build was still finishing.
+            with file_lock(self.directory / 'service.lock', 30):
                 launch = self.directory / 'launch.json'
                 _atomic_json(launch, {'config': config_payload(self.config), 'token': secrets.token_hex(32)})
                 os.chmod(launch, 0o600)
-                if os.name == 'nt':
-                    from .qwen_windows import spawn_worker
-                    spawn_worker(sys.executable, Path(__file__).resolve().parents[2] / 'tools/service_worker.py',
-                                 launch, self.config.data_dir)
-                else:
-                    environment = os.environ.copy()
-                    environment['PYTHONPATH'] = str(Path(__file__).resolve().parents[1]) + os.pathsep + environment.get('PYTHONPATH', '')
-                    with (self.directory / 'service.log').open('ab') as log:
-                        self.spawned = subprocess.Popen([sys.executable, '-m', 'bubbleteait.service_worker', '--config', str(launch)],
-                            stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=environment, start_new_session=True)
+            # Spawn only after releasing the lock: the child acquires the same
+            # lock during startup, so holding it across WMI/cscript created a
+            # race where the new service died immediately.
+            if os.name == 'nt':
+                from .qwen_windows import spawn_worker
+                spawn_worker(sys.executable, Path(__file__).resolve().parents[2] / 'tools/service_worker.py',
+                             launch, self.config.data_dir)
+            else:
+                environment = os.environ.copy()
+                environment['PYTHONPATH'] = str(Path(__file__).resolve().parents[1]) + os.pathsep + environment.get('PYTHONPATH', '')
+                with (self.directory / 'service.log').open('ab') as log:
+                    self.spawned = subprocess.Popen([sys.executable, '-m', 'bubbleteait.service_worker', '--config', str(launch)],
+                        stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=environment, start_new_session=True)
             deadline = time.monotonic() + 30
             while time.monotonic() < deadline:
                 if self.probe():
@@ -511,12 +620,19 @@ class ServiceClient:
             saved = self.directory / 'registrations.json'
             return {'state': 'stopped', 'projects': [],
                     'saved_registrations': json.loads(saved.read_text()) if saved.exists() else {'manual': []}}
-        if action not in {'status', 'stop'}:
+        if action in {'heartbeat', 'release'} and not self.probe():
+            return {'state': 'stopped', 'found': False, 'released': False} if action == 'heartbeat' else {'state': 'stopped', 'released': False}
+        if action not in {'status', 'stop', 'heartbeat', 'release'}:
             self.ensure()
         state = self.state()
         result = self._call(state, action, {'lease': self.lease, **payload})
         if action == 'stop':
             self._wait_stopped(state.get('pid'), 5000)
+            # The worker removes state.json only after the coordinator has
+            # finished its current build. Reporting "stopped" earlier was a
+            # false success that made the next start hit the writer lock.
+            result = dict(result)
+            result['state'] = 'stopped' if not self.state_path.exists() else 'stopping'
         if action == 'select' and self._heartbeat_thread is None:
             ref, stop = weakref.ref(self), self._heartbeat_stop
             def heartbeat():
@@ -525,8 +641,12 @@ class ServiceClient:
                     if client is None:
                         return
                     try:
-                        if client.probe():
-                            client.request('heartbeat')
+                        renewed = client.request('heartbeat')
+                        if isinstance(renewed, dict) and not renewed.get('found') and client.last_path:
+                            # The service restarted and lost its lease table.
+                            # Re-register the last selected project instead of
+                            # silently renewing a lease that no longer exists.
+                            client.select(client.last_path)
                     except (OSError, ValueError):
                         pass
                     finally:
@@ -559,6 +679,7 @@ class ServiceClient:
                 pass
 
     def select(self, path, **kwargs):
+        self.last_path = str(path)
         return self.request('select', path=str(path), **kwargs)
 
     def close(self):

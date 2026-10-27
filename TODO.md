@@ -11,46 +11,44 @@
   не зависит от локальных `evals/`.
 - [x] Закоммитить baseline (`62de9d0`) и проверить чистый clone:
   268 tests OK, 12 skipped.
-- [ ] Добавить CI (Windows, Python 3.12): установка `.[mcp]`, `unittest`,
-  `bti doctor` без моделей и сети.
+- [x] Добавить CI (Windows, Python 3.12): `.github/workflows/ci.yml`
+  устанавливает `.[mcp]`, запускает `doctor` и `unittest`; первый прогон
+  будет после push.
 - [x] Закрепить в README только существующие документы; мёртвых ссылок нет.
-- [ ] Проверить `git submodule update --init --depth 1` из удалённого origin:
-  gitlink-ревизии уже совпадают с `docs/components.md`, скачивание не
-  запускалось.
+- [x] Проверить `git submodule update --init --depth 1` из удалённого origin:
+  `vendor/cocoindex-code` скачан в чистом clone на закреплённую ревизию;
+  остальные URL доступны, ревизии заданы gitlink.
 
 ## P1. Баги сервиса
 
-- [ ] `sync(wait=False)` должен возвращать `updating`/`queued`, а не `ready`
-  по старой композиции (`service.py`, `mcpserver.sync_project`).
-- [ ] `stop` не должен рапортовать успех, пока координатор не завершился;
-  `start` после `stop` не должен падать на `service.lock`.
-- [ ] Убрать гонку Windows-spawn: не держать `service.lock` во время WMI,
-  либо дать дочернему процессу таймаут и retry.
-- [ ] `heartbeat` для неизвестного lease: вернуть `found=false`; клиент
-  должен перерегистрироваться.
-- [ ] Битый `state.json`: карантин и восстановление вместо `JSONDecodeError`
-  в `status`/`ensure`.
-- [ ] `fingerprint` должен учитывать readiness индексов; удалённый/битый
-  индекс не должен оставлять проект в `ready`.
-- [ ] `register`/`project_info` не должны читать весь корпус под глобальным
-  `cv`; тяжёлую валидацию выполнять вне lock.
-- [ ] `freshness=wait` для неизменного проекта не должен ждать build другого
-  проекта: дешёвая проверка fingerprint до очереди build.
-- [ ] Смешанный batch известных ID и путей не должен читать пути из старой
-  композиции; запретить смешивание или вернуть версию для каждого excerpt.
+- [x] `sync(wait=False)` возвращает `updating`, пока новая ревизия не
+  опубликована; регрессия в `test_service`.
+- [x] `stop` возвращает `stopping`, если координатор ещё не завершился;
+  `ensure` ждёт `service.lock`, а не падает с `busy`.
+- [x] Windows-spawn больше не держит `service.lock` во время WMI/cscript.
+- [x] `heartbeat` возвращает `found`; клиент перерегистрирует проект после
+  потери lease.
+- [x] Битый `state.json` карантинится, `status`/`ensure` видят «stopped».
+- [x] `fingerprint` дополнен дешёвой проверкой readiness индексов; удалённый
+  индекс пересобирается, а не остаётся `ready`.
+- [x] `register`/`project_info` выполняют тяжёлую валидацию вне `cv`.
+- [x] `freshness=wait` подтверждает неизменный проект без ожидания build
+  другого проекта.
+- [x] Смешанный batch ID+path без `composition_id` отклоняется.
 
 ## P1. Fidelity и границы
 
-- [ ] `SearchService._decorate` должен требовать точный срез
-  `lines[start-1:end]`, а не подстроку; вынести общий verifier для
-  `search`/backend'ов.
-- [ ] `configuration.source_roots` сверять с зарегистрированным источником
-  или с `provenance.source_root`; иначе `read_source(mode="working")`
-  выходит за границы источника.
-- [ ] Разделить namespace alias и logical `source_id` в direct-фильтрах.
+- [x] `SearchService._decorate` требует точный срез
+  `lines[start-1:end]`, а не подстроку; content строится из snapshot.
+- [x] `configuration.source_roots` сверяется с `provenance.source_root`;
+  чужой root отклоняется.
+- [x] Alias и logical `source_id` не пересекаются; коллизия — ошибка.
+- [x] `_bytes` проверяет длину файла; `check-ignore` больше не теряет
+  tracked-но-ignored файлы.
 - [ ] Text-канал: не молча пропускать non-UTF8; сообщать skipped/unsearchable.
 - [ ] Text-канал: склеивать пересекающиеся окна, иначе один файл вытесняет
   остальные из top-k.
+- [ ] Вынести общий verifier результата backend'а для `search`/`cocoindex`/`qwen`.
 
 ## P1. Производительность
 
@@ -80,12 +78,13 @@
   расхождение между docstring, `setup.md` и `service.md`.
 - [ ] Один verifier результата backend'а вместо дублей в `search`,
   `cocoindex`, `qwen`.
-- [ ] Registry: writer lock для `register`/`compose`; убрать mutable
-  side-channel `_last_selection_rules`; GC staging/orphan units.
+- [x] Registry: writer lock для `register`/`compose`.
+- [ ] Убрать mutable side-channel `_last_selection_rules`; GC staging/orphan
+  units и retention старых compositions.
 - [ ] Сохранять причину исключения файла (`skipped`) в manifest, а не
   только в `preview`.
-- [ ] Проверить семантику `check-ignore --no-index` для tracked-но-ignored
-  файлов; не терять их молча.
+- [x] `check-ignore` больше не теряет tracked-но-ignored файлы; добавлен
+  регрессионный тест.
 
 ## P2. Документация
 

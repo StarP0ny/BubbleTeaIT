@@ -59,8 +59,7 @@ def serve(launch):
                         coordinator.release(request['lease'])
                         result = {'state': 'released'}
                     elif action == 'heartbeat':
-                        coordinator.heartbeat(request['lease'])
-                        result = {'state': 'renewed'}
+                        result = {'state': 'renewed', 'found': coordinator.heartbeat(request['lease'])}
                     elif action == 'stop':
                         coordinator.stop.set()
                         threading.Thread(target=server.shutdown, daemon=True).start()

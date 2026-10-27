@@ -59,6 +59,11 @@ class DirectMCPTests(unittest.TestCase):
         self.assertEqual(canonical['file_path'],'control.c')
         self.assertEqual(len(canonical['source_sha256']),64)
 
+    def test_mixed_issued_id_and_path_batch_requires_explicit_composition(self):
+        identifier = self.server.tools['context_search']('project', 'threshold')['excerpts'][0]['id']
+        with self.assertRaises(ToolError):
+            self.server.tools['read_sources'](None, [identifier, {'path': 'control.c'}])
+
     def test_composition_switch_does_not_resolve_old_evidence_in_new_scope(self):
         identifier=self.server.tools['context_search']('project','threshold')['excerpts'][0]['id']
         (self.source/'control.c').write_text('int threshold = 42;\n',encoding='utf-8');self.publish()

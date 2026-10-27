@@ -362,6 +362,41 @@ model_path="models/e5"
             asyncio.run(scenario())
 
 
+    def test_manual_sync_without_wait_reports_updating_and_then_waits(self):
+        self.register()
+        self.start()
+        (self.project / 'main.c').write_text('int threshold = 42;\n', encoding='utf-8')
+        queued = self.coordinator.select(self.project, lease='client', freshness='available', manual_sync=True)
+        self.assertEqual(queued['state'], 'updating', queued)
+        ready = self.coordinator.select(self.project, lease='client', freshness='wait', timeout_ms=5000)
+        self.assertEqual(ready['state'], 'ready', ready)
+
+    def test_missing_index_is_rebuilt_before_reporting_ready_again(self):
+        entry = self.register()
+        unit = SearchService(self.config.data_dir).load_composition(entry['composition_id'])['units'][0]['unit_id']
+        status = self.config.data_dir / 'indexes' / unit / 'status.json'
+        status.unlink()
+        self.assertFalse(self.coordinator._composition_ready(entry['composition_id']))
+        calls = len(self.backend.calls)
+        self.coordinator.check(str(self.project), force=True)
+        self.assertEqual(entry['state'], 'ready')
+        self.assertEqual(len(self.backend.calls), calls + 1)
+        self.assertTrue(self.coordinator._composition_ready(entry['composition_id']))
+
+    def test_heartbeat_reports_unknown_lease(self):
+        self.assertFalse(self.coordinator.heartbeat('missing'))
+        self.coordinator.register(self.project, lease='known')
+        self.assertTrue(self.coordinator.heartbeat('known'))
+
+    def test_broken_service_state_is_quarantined_and_treated_as_stopped(self):
+        client = ServiceClient(self.config)
+        client.directory.mkdir(parents=True)
+        client.state_path.write_text('{not json', encoding='utf-8')
+        self.assertIsNone(client.state())
+        self.assertFalse(client.state_path.exists())
+        self.assertTrue(list(client.directory.glob('state.invalid-*.json')))
+
+
 class ServiceProcessTests(unittest.TestCase):
     @unittest.skipUnless(importlib.util.find_spec('mcp'), 'Install MCP extra')
     def test_real_stdio_project_path_read_without_discovery_calls_or_embedding_runtime(self):

@@ -239,6 +239,21 @@ class SearchTests(unittest.TestCase):
         with self.assertRaisesRegex(SearchError, "changed during retrieval"):
             SearchService(self.registry.data_dir, backend).search("product", "sensor")
 
+    def test_backend_content_must_be_exact_slice_not_substring_of_range(self):
+        manifest = self.unit(content=b"one\ntwo\nthree\n")
+        self.compose(manifest)
+        backend = FakeBackend({manifest["unit_id"]: [{
+            "file_path": "sensor.c", "start_line": 1, "end_line": 3,
+            "content": "one\n", "score": 0.5}]})
+        with self.assertRaisesRegex(SearchError, "match source coordinates"):
+            SearchService(self.registry.data_dir, backend).search("product", "one")
+
+    def test_composition_source_root_must_match_registered_source(self):
+        manifest = self.unit()
+        self.compose(manifest, configuration={"source_roots": {"sensor": str(self.root / "other")}})
+        with self.assertRaisesRegex(SearchError, "source_roots"):
+            self.service.load_composition("product")
+
     def test_empty_file_read_has_one_empty_editor_line(self):
         manifest = self.unit(content=b"")
         result = self.service.read_source(manifest["unit_id"], "sensor.c")

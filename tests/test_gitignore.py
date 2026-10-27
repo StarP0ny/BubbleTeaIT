@@ -45,6 +45,13 @@ class GitIgnoreTests(unittest.TestCase):
         self.assertEqual(self.paths(), ["main.c"])
         self.assertFalse((self.checkout / ".git").exists())
 
+    def test_tracked_file_is_not_dropped_by_a_broad_ignore_rule(self):
+        self.write(".gitignore", "*.c\n")
+        self.write("generated.c")
+        self.git("init")
+        self.git("add", "-f", "generated.c")
+        self.assertEqual(self.paths(), ["generated.c"])
+
     def test_nested_negation_and_escaped_spaces_use_git_semantics(self):
         self.write(".gitignore", "*.tmp.md\nspace\\ name.md\n")
         self.write("docs/.gitignore", "*.md\n!keep.md\n")

@@ -303,6 +303,10 @@ class DirectService:
                 raise SearchError('Direct source alias collision')
             self.sources[alias] = unit
             self.aliases[unit['source_id']] = alias
+        # A logical source_id may itself look like an alias of another source.
+        # Reject such a composition instead of silently resolving the wrong one.
+        if set(self.sources) & set(self.aliases):
+            raise SearchError('Direct source alias collides with a logical source_id')
         self._ledger, self._lock = {}, threading.RLock()
         self._timings, self.last_profile = {}, None
 
@@ -322,7 +326,7 @@ class DirectService:
         if source_ids is not None:
             selected = []
             for source in source_ids:
-                alias = source if source in self.sources else self.aliases.get(source)
+                alias = self.aliases.get(source) or (source if source in self.sources else None)
                 if alias is None:
                     raise SearchError('Unknown direct source_id')
                 selected.append(self.sources[alias]['source_id'])
