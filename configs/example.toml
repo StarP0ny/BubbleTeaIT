@@ -1,0 +1,31 @@
+# Copy this file to configs/bti.toml for shared settings, or .local/config.toml
+# for machine-specific settings. Relative paths belong to this file's folder.
+# The doctor is read-only; these directories need not exist before installation.
+# Environment variables BTI_DATA_DIR / BTI_MODELS_DIR override paths below.
+
+[paths]
+data_dir = "../.local/data"
+# Set models_dir in .local/config.toml or BTI_MODELS_DIR for your machine.
+# Model profiles without an explicit path use models_dir / profile-name.
+
+[models.e5-small]
+enabled = true
+required = false
+files = ["config.json", "tokenizer_config.json"]
+# Add the actual weight filename(s) for the selected backend to this list.
+# A filesystem check is not evidence that a model can be loaded.
+
+[llm]
+base_url = "http://127.0.0.1:9931/v1"
+timeout_seconds = 5.0
+# model = "exact-model-id-from-GET-models"
+# api_key_env = "BTI_LLM_API_KEY"
+
+[mcp.serena]
+enabled = false
+transport = "stdio"
+command = "uv"
+args = ["run", "serena", "start-mcp-server", "--help"]
+# Configure the actual server command and project before enabling.
+# cwd = "../vendor/serena"
+# env_names = []

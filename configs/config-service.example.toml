@@ -1,0 +1,33 @@
+# Example only: adjust directories and the Python ML runtime before use.
+[service]
+data_dir = '${LOCALAPPDATA}/BubbleTeaIT'
+
+[paths]
+models_dir = 'E:/models'
+
+[sync]
+enabled = true
+debounce_ms = 2000
+poll_interval_seconds = 1
+reconcile_interval_seconds = 60
+
+[embedding]
+default_profile = "qwen06"
+
+[embedding.profiles.qwen06]
+backend = "qwen-dense"
+model_path = 'E:/models/embeddings/Qwen/Qwen3-Embedding-0.6B'
+python_executable = 'C:/BTI/embedding-runtime/python.exe'
+device = "auto"
+
+# Keep an E5 profile as well if historical E5 compositions are needed.
+# [embedding.profiles.e5]
+# backend = "cocoindex-code"
+# model_path = 'E:/models/embeddings/intfloat/multilingual-e5-small-cocoindex'
+# python_executable = 'C:/BTI/embedding-runtime/python.exe'
+
+[workspaces.example]
+path = 'C:/work'
+discover = ["*/bti.toml"]
+exclude = ["artifacts/**"]
+watch = true

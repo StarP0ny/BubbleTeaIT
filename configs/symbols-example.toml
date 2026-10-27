@@ -1,0 +1,6 @@
+# Paths are relative to this file. Install dependencies separately.
+[symbols]
+executable = '../.local/venvs/serena/Scripts/serena.exe'
+# Replace with the actual installed clangd path on your machine.
+clangd_path = '../.local/llvm/bin/clangd.exe'
+timeout_seconds = 120

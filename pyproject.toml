@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bubbleteait"
+version = "0.1.0"
+description = "Context and research tools for AI agents"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+dependencies = []
+
+[project.optional-dependencies]
+mcp = ["mcp==2.3.0"]
+indexing = ["cocoindex-code[full]==0.2.42", "cocoindex==1.0.26", "sentence-transformers==6.2.0"]
+
+[project.scripts]
+bti = "bubbleteait.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

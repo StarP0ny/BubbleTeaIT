@@ -1,0 +1,30 @@
+# Example only: copy into a separate local config and set the worker executable.
+# Existing E5 units remain routed to backends.cocoindex if it is also configured.
+# New default indexes use the fixed Qwen 0.6B recipe when backends.qwen exists.
+# Commands (global config flags precede the command):
+# bti --local-config PATH_TO_LOCAL_CONFIG worker status --json
+# bti --local-config PATH_TO_LOCAL_CONFIG worker load --json
+# bti --local-config PATH_TO_LOCAL_CONFIG worker unload --json
+# bti --local-config PATH_TO_LOCAL_CONFIG worker stop --json
+# Stdio MCP is unchanged: bti --local-config PATH_TO_LOCAL_CONFIG mcp
+
+[paths]
+models_dir = 'E:/models'
+# data_dir defaults to the platform's BubbleTeaIT application data directory.
+
+[models."qwen-0.6b"]
+path = 'E:/models/embeddings/Qwen/Qwen3-Embedding-0.6B'
+enabled = true
+required = true
+files = ['config.json', 'model.safetensors', 'bti-model-manifest.json']
+
+[backends.qwen]
+# Replace this placeholder with the absolute Python path of a CUDA environment.
+python_executable = 'C:/path/BubbleTeaIT/.local/venvs/embedding-cuda/Scripts/python.exe'
+model_profile = 'qwen-0.6b'
+timeout_seconds = 600
+
+# The model/revision, dimension=1024, max_length=1024 and pooling/dtype/prompts
+# are fixed in the backend recipe, not arbitrary options in this TOML section.
+# status performs a health check without loading the GPU model. load is explicit;
+# indexing/search may lazily load the worker. No model downloads are performed.

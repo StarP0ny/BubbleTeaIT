@@ -1,0 +1,15 @@
+[submodule "vendor/cocoindex-code"]
+	path = vendor/cocoindex-code
+	url = https://github.com/cocoindex-io/cocoindex-code.git
+[submodule "vendor/serena"]
+	path = vendor/serena
+	url = https://github.com/oraios/serena.git
+[submodule "vendor/qmd"]
+	path = vendor/qmd
+	url = https://github.com/tobi/qmd.git
+[submodule "vendor/LightRAG"]
+	path = vendor/LightRAG
+	url = https://github.com/HKUDS/LightRAG.git
+[submodule "vendor/ragflow"]
+	path = vendor/ragflow
+	url = https://github.com/infiniflow/ragflow.git

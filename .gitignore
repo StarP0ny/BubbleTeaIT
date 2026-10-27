@@ -1,0 +1,34 @@
+# Local configuration, source snapshots and experimental evidence.
+/.local/
+/.venv/
+/.env
+/.env.*
+!/.env.example
+__pycache__/
+*.py[cod]
+/.pytest_cache/
+/.ruff_cache/
+/dist/
+/build/
+/*.egg-info/
+/src/*.egg-info/
+# Runtime data normally lives outside the checkout (BTI_DATA_DIR).
+/data/
+/models/
+/indexes/
+/docs/evals/
+/docs/research/
+/evals/
+/infra/
+/profiles/
+
+# Local-only working material kept out of the product baseline.
+# Files moved here remain on disk; they are not part of the repository.
+/attic/
+
+# Editor/OS noise.
+/.idea/
+/.vscode/
+*.log
+Thumbs.db
+desktop.ini
