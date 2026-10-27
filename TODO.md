@@ -103,3 +103,14 @@
   task success, hit@5/10, токены, wall time.
 - [ ] Не менять инструмент во время контрольного прогона.
 - [ ] Повторить на реальном корпусе после исправлений retrieval.
+
+## Отложено: исследователь
+
+- [ ] Вернуть `research_*` слой после стабилизации прямого BTI. Код, тесты,
+  worker и bridge лежат в `attic/src`, `attic/tests`, `attic/tools`;
+  `research_serena`/`research_tools` уже стали `serena_workspace`/`pinned`.
+- [ ] Условия возврата: независимый benchmark прямого поиска, стабильный
+  service/MCP, отдельный профиль зависимостей (`pydantic-ai`/Codex CLI),
+  решение по вторичным MCP и бюджетам.
+- [ ] При возврате восстановить `research_start/status/cancel`, CLI `research`,
+  конфиг `[research]` и проверить, что вторичные MCP действительно доступны.
