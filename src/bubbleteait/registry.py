@@ -34,6 +34,8 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import threading
+import time
 from typing import Any, Mapping, Sequence
 import uuid
 
@@ -48,6 +50,17 @@ DEFAULT_EXCLUDES = tuple(
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _UNIT_ID = re.compile(r"u-[0-9a-f]{64}\Z")
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
+
+# Reconciliation may inspect the same corpus repeatedly. Reuse only the
+# digest/encoding result while size, mtime, ctime and inode all match; the
+# checked snapshot path still reads and compares the actual bytes.
+_FILE_STATE_LOCK = threading.Lock()
+_FILE_STATE_CACHE: dict[str, tuple[tuple[int, int, int, int], float, dict]] = {}
+_FILE_STATE_LIMIT = 200_000
+# A stat signature is an optimization, not proof of content identity
+# (notably on Windows, where st_ctime is creation time). Revalidate
+# periodically; explicit preview/sync passes force it immediately.
+_FILE_STATE_TTL_SECONDS = 30.0
 
 
 class RegistryError(ValueError):
@@ -253,6 +266,48 @@ def _read_file(path: Path) -> tuple[bytes, dict]:
     if (before.st_size, before.st_mtime_ns, before.st_ino) != (after.st_size, after.st_mtime_ns, after.st_ino) or len(content) != after.st_size:
         raise SnapshotChangedError(f"Source changed while reading: {path}")
     return content, {"sha256": hashlib.sha256(content).hexdigest(), "size": len(content)}
+
+
+def _file_state(path: Path, *, refresh: bool = False) -> dict:
+    """Return digest and text-readiness, reusing stat-identical results briefly.
+
+    This is an optimization for reconciliation and preview only. A cached entry
+    is reused only while the full stat signature matches and the entry is younger
+    than the TTL; explicit preview/sync passes use ``refresh=True``. Checked
+    capture and every published snapshot still hash the actual bytes.
+    """
+    before = path.stat()
+    if not stat.S_ISREG(before.st_mode):
+        raise RegistryError(f"Selected path is not a regular file: {path}")
+    key = os.path.normcase(str(path.absolute()))
+    signature = (before.st_size, before.st_mtime_ns, before.st_ctime_ns, before.st_ino)
+    now = time.monotonic()
+    with _FILE_STATE_LOCK:
+        cached = _FILE_STATE_CACHE.get(key)
+    if (not refresh and cached is not None and cached[0] == signature
+            and now - cached[1] < _FILE_STATE_TTL_SECONDS):
+        return dict(cached[2])
+    content, entry = _read_file(path)
+    after = path.stat()
+    # Cache only a signature we verified both before and after the read. This
+    # prevents a digest read from a racing file being filed under an older stat.
+    checked = (after.st_size, after.st_mtime_ns, after.st_ctime_ns, after.st_ino)
+    if checked != signature:
+        raise SnapshotChangedError(f"Source changed while reading: {path}")
+    try:
+        content.decode("utf-8")
+        utf8, utf8_error = True, None
+    except UnicodeDecodeError as error:
+        utf8, utf8_error = False, error.start
+    value = {**entry, "utf8": utf8, "utf8_error": utf8_error, "binary_nul": b"\0" in content}
+    with _FILE_STATE_LOCK:
+        if len(_FILE_STATE_CACHE) >= _FILE_STATE_LIMIT:
+            # Drop the oldest quarter instead of clearing the whole corpus at once.
+            ordered = sorted(_FILE_STATE_CACHE.items(), key=lambda item: item[1][1])
+            for old_key, _ in ordered[:max(1, _FILE_STATE_LIMIT // 4)]:
+                _FILE_STATE_CACHE.pop(old_key, None)
+        _FILE_STATE_CACHE[key] = (checked, time.monotonic(), value)
+    return dict(value)
 
 
 def _git_provenance(root: Path) -> dict:
@@ -463,7 +518,8 @@ class Registry:
         if spec.root.is_relative_to(self.data_dir):
             raise RegistryError("Source root cannot be the registry data directory or a directory inside it")
 
-    def _inventory(self, spec: SourceSpec, *, skipped: list | None = None) -> list[dict]:
+    def _inventory(self, spec: SourceSpec, *, skipped: list | None = None,
+                   refresh: bool = False) -> list[dict]:
         selected = []
         policy = _IgnorePolicy(spec.root) if spec.respect_gitignore else None
 
@@ -518,8 +574,8 @@ class Registry:
                     path = _safe_file(spec.root, relative)
                     if path.resolve().is_relative_to(self.data_dir):
                         continue
-                    _, entry = _read_file(path)
-                    selected.append({"path": relative, **entry})
+                    state = _file_state(path, refresh=refresh)
+                    selected.append({"path": relative, "sha256": state["sha256"], "size": state["size"]})
             if policy:
                 policy.verify()
             self._last_selection_rules = dict(policy.rules) if policy else {}
@@ -528,23 +584,22 @@ class Registry:
                 policy.close()
         return sorted(selected, key=lambda entry: entry["path"])
 
-    def preview(self, spec: SourceSpec) -> dict:
+    def preview(self, spec: SourceSpec, *, refresh: bool = False) -> dict:
         """Inspect the exact selection and UTF-8 readiness without registration or ML."""
         spec = _checked_spec(spec)
         self._check_source_boundary(spec)
         skipped = []
-        files = self._inventory(spec, skipped=skipped)
+        files = self._inventory(spec, skipped=skipped, refresh=refresh)
         rules = dict(self._last_selection_rules)
         errors = []
         for entry in files:
-            raw, checked = _read_file(_safe_file(spec.root, entry["path"]))
-            if checked != {"sha256": entry["sha256"], "size": entry["size"]}:
+            checked = _file_state(_safe_file(spec.root, entry["path"]))
+            if checked["sha256"] != entry["sha256"] or checked["size"] != entry["size"]:
                 raise SnapshotChangedError("Source changed during preview: " + entry["path"])
-            try:
-                raw.decode("utf-8")
-            except UnicodeDecodeError as error:
-                errors.append({"path": entry["path"], "reason": "not_utf8", "byte_offset": error.start})
-            if b"\0" in raw:
+            if not checked["utf8"]:
+                errors.append({"path": entry["path"], "reason": "not_utf8",
+                               "byte_offset": checked["utf8_error"]})
+            if checked["binary_nul"]:
                 errors.append({"path": entry["path"], "reason": "binary_nul"})
         return {"source_id": spec.source_id, "root": str(spec.root), "role": spec.role,
                 "files": files, "file_count": len(files), "skipped": skipped,
@@ -564,7 +619,7 @@ class Registry:
         spec = self.source(source_id)
         recipe_value = _recipe(recipe)
         recipe_hash = _digest(recipe_value)
-        files = self._inventory(spec)
+        files = self._inventory(spec, refresh=True)
         selection_rules = dict(self._last_selection_rules)
         if not files:
             raise RegistryError(f"No files selected for source: {source_id}")
@@ -585,7 +640,7 @@ class Registry:
             destination = staging / "files" / entry["path"]
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_bytes(content)
-        if self._inventory(spec) != files or self._last_selection_rules != selection_rules:
+        if self._inventory(spec, refresh=True) != files or self._last_selection_rules != selection_rules:
             raise SnapshotChangedError("Selected source files changed during capture")
 
         manifest = {

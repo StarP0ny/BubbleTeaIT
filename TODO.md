@@ -35,6 +35,16 @@
 - [x] `freshness=wait` подтверждает неизменный проект без ожидания build
   другого проекта.
 - [x] Смешанный batch ID+path без `composition_id` отклоняется.
+- [x] Путь вне снимка различает `outside_sources`, `excluded`,
+  `sync_pending` и `not_found`; `ambiguous_path` перечисляет кандидатов.
+- [x] Обнаруженное изменение увеличивает ревизию; `freshness=wait` ждёт
+  проход, который его покрывает.
+- [x] Изменение источника во время сборки повторяется один раз; при
+  непрерывных правках остаётся явная ошибка без неполного состава.
+- [x] `service config show` показывает `origins`; текст `watch --list`
+  показывает причину наблюдения.
+- [x] Workspace-путь без `project` разрешён только для workspace из одного
+  проекта; правило зафиксировано в `service.md`.
 
 ## P1. Fidelity и границы
 
@@ -58,10 +68,11 @@
 - [ ] `index_status` не должен вызывать `load_unit(verify_files=True)`.
 - [ ] `_decorate` не должен перечитывать файл на каждую строку; кэш
   `path -> (lines, sha)` на время запроса.
-- [ ] Poll: stat-fast-path `(path,size,mtime_ns)` до sha256; дефолт
-  `poll_interval_seconds` 10–30 с вместо 1 с.
+- [x] Poll: stat-fast-path `(path,size,mtime_ns,ctime_ns,inode)` до sha256;
+  дефолт `poll_interval_seconds` 10 с вместо 1 с.
 - [ ] `git check-ignore` батчами, а не subprocess на каждый каталог.
-- [ ] `preview` не должен читать каждый файл дважды.
+- [x] `preview` не перечитывает неизменившийся файл: digest/encoding
+  переиспользуются по stat-подписи.
 - [ ] Упаковка direct: не сериализовать весь ответ на каждый вариант окна.
 - [ ] Замерить p95 search/read на среднем и крупном корпусе; зафиксировать бюджет.
 

@@ -53,12 +53,16 @@ def output(value, as_json):
             print('Выдача ограничена; omitted_count:', value.get('omitted_count', 0),
                   'omitted_projects:', value.get('omitted_projects', []))
     elif 'projects' in value:
-        print('Сервис:', value.get('state', 'running'))
+        sync_enabled = value.get('sync_enabled', True)
+        print('Сервис:', value.get('state', 'running') + ('' if sync_enabled else ' (sync disabled)'))
         for name, path in value.get('workspaces', {}).items():
             print(f'Workspace {name}: {path}')
-        print('Workspace\tProject\tPath\tState')
+        print('Workspace\tProject\tPath\tState\tWatching\tManual\tClients')
         for p in value['projects']:
-            print(f'{",".join(p.get("workspaces", [])) or "—"}\t{p.get("project") or "—"}\t{p.get("path", "")}\t{p["state"]}')
+            watching = ('paused' if not sync_enabled else 'yes') if p.get('watching') else 'no'
+            print(f'{",".join(p.get("workspaces", [])) or "—"}\t{p.get("project") or "—"}\t'
+                  f'{p.get("path", "")}\t{p["state"]}\t{watching}\t'
+                  f'{"yes" if p.get("manual") else "no"}\t{p.get("temporary_clients", 0)}')
             if p.get('error'):
                 print('  Ошибка:', p['error'])
         if value.get('config_error'):

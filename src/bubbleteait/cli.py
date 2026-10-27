@@ -262,7 +262,7 @@ def main(argv: list[str] | None = None) -> int:
                 if config.project_config is None:
                     raise ConfigError("No bti.toml found; use --project-file")
                 project = load_project(config.project_config)
-                result = project.plan(config.data_dir)
+                result = project.plan(config.data_dir, refresh=True)
                 if args.command == "sync":
                     if not result['ready']:
                         print(json.dumps(result, ensure_ascii=False, indent=2))

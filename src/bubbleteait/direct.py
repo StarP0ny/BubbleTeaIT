@@ -15,6 +15,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 from pathlib import PurePosixPath
 import re
 import sqlite3
@@ -22,7 +23,8 @@ import threading
 import time
 
 from .application import ConfiguredBackend, make_backend
-from .registry import Registry, RegistryError
+from .config import ConfigError
+from .registry import Registry, RegistryError, SnapshotChangedError
 from .search import SearchError, SearchService, _filter_values, _path_matches, _text
 
 
@@ -309,6 +311,7 @@ class DirectService:
             raise SearchError('Direct source alias collides with a logical source_id')
         self._ledger, self._lock = {}, threading.RLock()
         self._timings, self.last_profile = {}, None
+        self._diagnosis_cache = {}
 
     @contextmanager
     def _measure(self, stage):
@@ -589,6 +592,130 @@ class DirectService:
         return self._pack(selected, max_chars, include_catalog=include_catalog,
                           candidate_files=len({(row['row']['unit_id'], row['row']['file_path']) for row in candidates.values()}))
 
+    def _source_root(self, unit):
+        from pathlib import Path
+        root = self.composition.get('configuration', {}).get('source_roots', {}).get(unit['source_id'])
+        root = root or unit.get('provenance', {}).get('source_root')
+        return Path(root).resolve() if root else None
+
+    @staticmethod
+    def _path_key(value):
+        # Windows filesystems are case-insensitive; list_files returns POSIX paths.
+        return os.path.normcase(value.replace('\\', '/')) if os.name == 'nt' else value
+
+    def _path_roots(self, raw, source_id=None):
+        """Return (unit, relative) for the most specific declared root containing the target."""
+        from pathlib import Path
+        if source_id is not None:
+            # Keep filter errors (unknown source_id/alias) visible: they are not
+            # filesystem misses, and the client must re-run list_files instead.
+            _, sources = self._filters(None, [source_id])
+            unit = self.sources[self.aliases[sources[0]]]
+            root = self._source_root(unit)
+            if root is None:
+                return []
+            try:
+                target = Path(raw)
+                if target.drive and not target.root:
+                    return []
+                target = target if target.is_absolute() else root / target
+                relative = target.resolve().relative_to(root)
+            except (OSError, RuntimeError, ValueError):
+                return []
+            return [(unit, relative.as_posix())]
+        try:
+            target = Path(raw)
+            if target.drive and not target.root:
+                return []
+            target = target if target.is_absolute() else self.project_root / target
+            target = target.resolve()
+        except (OSError, RuntimeError, ValueError):
+            return []
+        matches = []
+        for unit in self.units.values():
+            root = self._source_root(unit)
+            if root is None:
+                continue
+            try:
+                relative = target.relative_to(root)
+            except ValueError:
+                continue
+            matches.append((len(str(root)), unit, relative.as_posix()))
+        if not matches:
+            return []
+        # A nested module root owns its subtree; the parent source deliberately
+        # excludes it in project.plan, so report only the most specific roots.
+        specific = max(length for length, _, _ in matches)
+        return [(unit, relative) for length, unit, relative in matches if length == specific]
+
+    def _current_selection(self, source_id):
+        """Return (selection, error) for one source without scanning the whole project."""
+        from pathlib import Path
+        components = self.composition.get('configuration', {}).get('bti', {}).get('components', [])
+        config_path = (Path(components[0]['config']) if components and components[0].get('config')
+                       else self.project_root / 'bti.toml')
+        try:
+            stat = config_path.stat()
+        except OSError:
+            return None, None
+        key = (str(config_path), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_ino, source_id)
+        cached = self._diagnosis_cache.get(key)
+        if cached is not None and time.monotonic() - cached[0] < 5:
+            return cached[1], cached[2]
+        try:
+            from .project import load_project
+            project = load_project(config_path)
+            spec = next((item for item in project.sources if item.source_id == source_id), None)
+            if spec is None:
+                return None, None
+            selection = Registry(self.service.data_dir).preview(spec)
+        except (ConfigError, SnapshotChangedError, RegistryError, OSError) as exc:
+            error = f'{type(exc).__name__}: {str(exc)[:200]}'
+            if len(self._diagnosis_cache) >= 32:
+                self._diagnosis_cache.clear()
+            self._diagnosis_cache[key] = (time.monotonic(), None, error)
+            return None, error
+        if len(self._diagnosis_cache) >= 32:
+            self._diagnosis_cache.clear()
+        self._diagnosis_cache[key] = (time.monotonic(), selection, None)
+        return selection, None
+
+    def _missing_path_reason(self, raw, source_id=None):
+        """Explain a path absent from the pinned snapshot using the current selection."""
+        roots = self._path_roots(raw, source_id)
+        if not roots:
+            return ('outside_sources: path is outside the declared source roots; '
+                    'check source.path/include/exclude')
+        if len(roots) > 1:
+            labels = ', '.join(f'{unit["source_id"]}:{relative}' for unit, relative in roots[:4])
+            return f'ambiguous_path: {labels}; pass source_id'
+        unit, relative = roots[0]
+        selection, error = self._current_selection(unit['source_id'])
+        if selection is None:
+            if error:
+                return f'not_found: current selection is unavailable ({error})'
+            return 'not_found: path is not in the pinned composition'
+        key = self._path_key(relative)
+        # A file that cannot be decoded is not merely delayed; report the actual
+        # readiness error instead of advertising sync_pending forever.
+        error = next((item for item in selection.get('encoding_errors', [])
+                      if self._path_key(item['path']) == key), None)
+        if error is not None:
+            return f'excluded: {error["reason"]}; the selected file is not readable text'
+        if not selection.get('ready'):
+            blockers = selection.get('encoding_errors', [])
+            detail = ', '.join(f'{item["path"]}:{item["reason"]}' for item in blockers[:3]) or 'empty source'
+            return f'excluded: source_not_ready ({detail}); fix or exclude the blocking files'
+        if any(self._path_key(item['path']) == key for item in selection['files']):
+            return ('sync_pending: the file is selected now but absent from the pinned composition; '
+                    'retry with freshness=wait without an explicit composition_id')
+        for item in selection.get('skipped', []):
+            skipped = item['path'].rstrip('/')
+            skipped_key = self._path_key(skipped)
+            if key == skipped_key or key.startswith(skipped_key + '/'):
+                return f'excluded: {item["reason"]}; the current selection does not include this path'
+        return 'not_found: path is not selected by the current project; check source.include/exclude or attach'
+
     def path_request(self, request):
         """Resolve a known project/absolute path against the pinned whitelist only."""
         from pathlib import Path
@@ -599,31 +726,15 @@ class DirectService:
         raw = request['path']
         if not isinstance(raw, str) or not raw or '..' in raw.replace('\\', '/').split('/'):
             raise SearchError('Path traversal or empty path is not allowed')
-        if 'source_id' in request:
-            _, sources = self._filters(None, [request['source_id']])
-            unit = self.sources[self.aliases[sources[0]]]
-            candidates = [(unit, raw)]
-        else:
-            path = Path(raw)
-            target = path if path.is_absolute() else self.project_root / path
-            candidates = []
-            for unit in self.units.values():
-                root = self.composition.get('configuration', {}).get('source_roots', {}).get(unit['source_id'])
-                root = root or unit['provenance'].get('source_root')
-                if not root:
-                    continue
-                root = Path(root).resolve()
-                try:
-                    relative = target.absolute().relative_to(root)
-                except ValueError:
-                    continue
-                # Reject a working junction/symlink escape even though the read uses snapshot bytes.
-                if not target.resolve().is_relative_to(root):
-                    raise SearchError('Path escapes its declared source root')
-                if any(f['path'] == relative.as_posix() for f in unit['files']):
-                    candidates.append((unit, relative.as_posix()))
+        # Paths from list_files are POSIX; accept native separators only on
+        # Windows, where a backslash cannot be part of a file name.
+        if os.name == 'nt' and not Path(raw).is_absolute():
+            raw = raw.replace('\\', '/')
+        roots = self._path_roots(raw, request.get('source_id'))
+        candidates = [(unit, relative) for unit, relative in roots
+                      if any(self._path_key(f['path']) == self._path_key(relative) for f in unit['files'])]
         if len(candidates) != 1:
-            raise SearchError('ambiguous_path' if candidates else 'not_found: path is outside the pinned whitelist; check config/ignore or wait for sync')
+            raise SearchError(self._missing_path_reason(raw, request.get('source_id')))
         unit, path = candidates[0]
         _, content, _ = self.service._snapshot_file(unit, path)
         total = len(_text(content).splitlines()) or 1
@@ -637,6 +748,9 @@ class DirectService:
         _pack_arguments(max_chars, include_catalog)
         if not isinstance(requests, list) or not 1 <= len(requests) <= 20:
             raise SearchError('read_many needs 1..20 requests')
+        # Diagnose all missing paths against one fresh selection per batch;
+        # caching across batches hid files created since the previous error.
+        self._diagnosis_cache.clear()
         self.service.load_composition(self.composition_id)
         values = []
         for index, request in enumerate(requests):

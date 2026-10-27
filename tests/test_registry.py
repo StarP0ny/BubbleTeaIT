@@ -193,6 +193,43 @@ class RegistryTests(unittest.TestCase):
             with self.assertRaisesRegex(RegistryError, "symlink"):
                 self.snapshot()
 
+    def test_preview_reuses_unchanged_stat_state_and_rechecks_changed_files(self):
+        self.write("main.c", b"int value = 1;\n")
+        spec = SourceSpec("app", "project", self.checkout)
+        self.register()
+        self.assertTrue(self.registry.preview(spec)["ready"])
+        from bubbleteait import registry as implementation
+        original = implementation._read_file
+        calls = []
+        def counted(path):
+            calls.append(path)
+            return original(path)
+        with patch("bubbleteait.registry._read_file", side_effect=counted):
+            self.assertTrue(self.registry.preview(spec)["ready"])
+        self.assertEqual(calls, [])
+        # Different length makes the stat signature change deterministic even on
+        # filesystems with coarse mtime granularity.
+        self.write("main.c", b"int value = 20;\n")
+        with patch("bubbleteait.registry._read_file", side_effect=counted):
+            self.assertTrue(self.registry.preview(spec)["ready"])
+        self.assertEqual(len(calls), 1)
+
+    def test_file_state_ttl_forces_revalidation(self):
+        self.write("main.c", b"int value = 1;\n")
+        spec = SourceSpec("app", "project", self.checkout)
+        self.assertTrue(self.registry.preview(spec)["ready"])
+        from bubbleteait import registry as implementation
+        original = implementation._read_file
+        calls = []
+        def counted(path):
+            calls.append(path)
+            return original(path)
+        with patch("bubbleteait.registry._FILE_STATE_TTL_SECONDS", 0), \
+                patch("bubbleteait.registry._read_file", side_effect=counted):
+            self.assertTrue(self.registry.preview(spec)["ready"])
+        # Both preview phases revalidate when the TTL has expired.
+        self.assertEqual(len(calls), 2)
+
     def test_tampered_snapshot_bytes_are_rejected(self):
         self.write("main.c", b"original")
         self.register()
@@ -241,12 +278,12 @@ class RegistryTests(unittest.TestCase):
         original = self.registry._inventory
         calls = 0
 
-        def add_after_copy(spec):
+        def add_after_copy(spec, **kwargs):
             nonlocal calls
             calls += 1
             if calls == 2:
                 self.write("new.c", b"added during capture")
-            return original(spec)
+            return original(spec, **kwargs)
 
         with patch.object(self.registry, "_inventory", side_effect=add_after_copy):
             with self.assertRaises(SnapshotChangedError):

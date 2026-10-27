@@ -22,8 +22,11 @@ import weakref
 
 from .config import Config, ConfigError, ModelConfig, CocoIndexConfig, QwenConfig, SymbolsConfig, load_config
 from .project import load_project, project_info, sync_project
-from .registry import Registry, _atomic_json, _digest, _matches, _IgnorePolicy
+from .registry import Registry, RegistryError, SnapshotChangedError, _atomic_json, _digest, _matches, _IgnorePolicy
 from .qwen_runtime import file_lock, NoRedirect
+
+
+DEFAULT_POLL_SECONDS = 10
 
 
 def now():
@@ -60,7 +63,7 @@ def config_payload(config):
     """Only coordinator settings; credentials and non-service configuration are not exported."""
     keys = ('project_dir', 'data_dir', 'models_dir', 'models', 'loaded_files', 'cocoindex',
             'qwen', 'symbols', 'project_config', 'service_file', 'sync', 'workspaces', 'embedding_profile',
-            'embedding_override', 'sync_overrides', 'embedding_profiles')
+            'embedding_override', 'sync_overrides', 'embedding_profiles', 'origins')
     raw = asdict(config)
     return json.loads(json.dumps({k: raw[k] for k in keys}, default=str))
 
@@ -162,8 +165,10 @@ class Coordinator:
         if key not in self.entries:
             self.entries[key] = {'path': key, 'project': None, 'manual': False, 'workspaces': [],
                 'leases': {}, 'state': 'initializing', 'error': None, 'composition_id': None,
-                'composition_hash': None, 'requested_revision': 0, 'published_revision': -1,
-                'fingerprint': None, 'pending': None, 'changed_at': 0.0, 'first_change': 0.0,
+                'composition_hash': None, 'requested_revision': 0, 'explicit_revision': 0,
+                'published_revision': -1, 'force_check': False,
+                'fingerprint': None, 'detected_fingerprint': None, 'pending': None,
+                'changed_at': 0.0, 'first_change': 0.0,
                 'next_check': 0.0, 'last_checked_at': None, 'sources': [], 'config_hash': None}
         return self.entries[key]
 
@@ -260,7 +265,8 @@ class Coordinator:
 
     def status(self):
         with self.cv:
-            return {'state': 'running', 'projects': [self._public(e) for e in self.entries.values() if self.active(e)],
+            return {'state': 'running', 'sync_enabled': self.config.sync.get('enabled', True),
+                    'projects': [self._public(e) for e in self.entries.values() if self.active(e)],
                     'workspaces': {k: str(v['path']) for k, v in self.config.workspaces.items()},
                     'workspace_errors': dict(self.workspace_errors), 'config_error': self.config_error}
 
@@ -366,7 +372,7 @@ class Coordinator:
         try:
             config = replace(self.config, project_dir=Path(key), project_config=Path(key) / 'bti.toml')
             project = load_project(config.project_config)
-            plan = project.plan(config.data_dir)
+            plan = project.plan(config.data_dir, refresh=True)
             if not plan['ready']:
                 return False
             recipe = (self.recipe_factory or _recipe)(config)
@@ -380,12 +386,39 @@ class Coordinator:
                 return False
             e.update(state='ready', error=None, last_checked_at=now(),
                      published_revision=max(e['published_revision'], target), pending=None,
-                     next_check=time.monotonic() + self.config.sync.get('poll_interval_seconds', 1))
+                     detected_fingerprint=fingerprint)
+            if e['requested_revision'] <= target:
+                e['force_check'] = False
+                e['manual_sync'] = False
+                e['next_check'] = time.monotonic() + self.config.sync.get(
+                    'poll_interval_seconds', DEFAULT_POLL_SECONDS)
+            else:
+                # A newer waiter arrived while this confirmation was planning;
+                # preserve the immediate check it requested.
+                e['next_check'] = 0
             self.cv.notify_all()
             return True
 
-    def check(self, key, *, force=False):
-        """Run one serialized reconcile. Injectable factories allow model-free behavioral tests."""
+    @staticmethod
+    def _retryable_sync(exc):
+        text = str(exc)
+        if isinstance(exc, SnapshotChangedError) or isinstance(exc, FileNotFoundError):
+            return True
+        if isinstance(exc, RegistryError):
+            # A source disappearing/reappearing mid-pass is transient; permanent
+            # registry faults (missing Git/model manifest, invalid composition)
+            # are not retried just to duplicate the same expensive failure.
+            return 'Source changed' in text or 'not a regular file' in text
+        return 'Source changed' in text or 'configuration changed' in text
+
+    def check(self, key, *, force=False, retry=True):
+        """Run one serialized reconcile. Injectable factories allow model-free behavioral tests.
+
+        A detected content/config change increments the requested revision, so a
+        concurrent ``freshness=wait`` waits for a pass that covers it. A source
+        changing during the pass is retried once with a fresh plan; a persistent
+        writer still ends in ``error`` without publishing a partial composition.
+        """
         from .application import make_backend
         from .cli import _recipe
         with self.cv:
@@ -399,7 +432,7 @@ class Coordinator:
                     if other['path'] != key and other['project'] == project.name and self.active(other):
                         raise ConfigError(f'Duplicate project name {project.name}: {other["path"]} and {key}')
                 e['project'] = project.name
-            plan = project.plan(config.data_dir)
+            plan = project.plan(config.data_dir, refresh=force)
             if not plan['ready']:
                 raise ConfigError('Project preflight failed; inspect bti plan: ' +
                                   json.dumps(plan, ensure_ascii=False, default=str)[:3000])
@@ -410,9 +443,22 @@ class Coordinator:
             with self.cv:
                 e['last_checked_at'] = now()
                 e['sources'] = [s.source_id for s in project.sources]
+                if fingerprint != e['fingerprint']:
+                    # Revisions describe the corpus, not only explicit client
+                    # requests. Count each detected fingerprint once, even while
+                    # debounce/retry keeps the same candidate pending.
+                    if fingerprint != e['detected_fingerprint']:
+                        e['requested_revision'] += 1
+                        e['detected_fingerprint'] = fingerprint
+                    revision = e['requested_revision']
+                else:
+                    e['detected_fingerprint'] = fingerprint
                 if fingerprint == e['fingerprint'] and self._composition_ready(e['composition_id']):
-                    e.update(state='ready', error=None, published_revision=revision,
-                             next_check=moment + config.sync.get('poll_interval_seconds', 1),
+                    # Do not promote a newer request here: this pass covers the
+                    # fingerprint computed before that request arrived.
+                    e.update(state='ready', error=None,
+                             published_revision=max(e['published_revision'], revision),
+                             next_check=moment + config.sync.get('poll_interval_seconds', DEFAULT_POLL_SECONDS),
                              pending=None)
                     self.cv.notify_all()
                     return
@@ -429,9 +475,17 @@ class Coordinator:
             result = sync_project(project, config, recipe, backend, plan=plan)
             with self.cv:
                 e.update(composition_id=result['pinned_composition_id'], composition_hash=result['composition_hash'],
-                         config_hash=project.config_hash, fingerprint=fingerprint, pending=None, first_change=0.0,
-                         state='ready', error=None, published_revision=revision,
-                         next_check=time.monotonic() + config.sync.get('poll_interval_seconds', 1))
+                         config_hash=project.config_hash, fingerprint=fingerprint,
+                         detected_fingerprint=fingerprint, pending=None, first_change=0.0,
+                         state='ready', error=None,
+                         published_revision=max(e['published_revision'], revision),
+                         next_check=time.monotonic() + config.sync.get('poll_interval_seconds', DEFAULT_POLL_SECONDS))
+                self.cv.notify_all()
+        except (ConfigError, SnapshotChangedError, RegistryError, OSError) as exc:
+            if retry and self._retryable_sync(exc):
+                return self.check(key, force=True, retry=False)
+            with self.cv:
+                e.update(state='error', error=str(exc), failed_revision=revision, next_check=time.monotonic() + 5)
                 self.cv.notify_all()
         except Exception as exc:
             with self.cv:
@@ -448,15 +502,19 @@ class Coordinator:
             e = self.entries[key]
             if manual_sync:
                 e['manual_sync'] = True
+                e['force_check'] = True
                 e['next_check'] = 0
                 if freshness != 'wait':
                     e['requested_revision'] += 1
+                    e['explicit_revision'] += 1
                     manual_target = e['requested_revision']
                 self.cv.notify_all()
             if not self.config.sync.get('enabled', True) and not manual_sync and freshness == 'wait':
                 return {'state': 'sync_disabled', 'sync': self._public(e)}
             if freshness == 'wait':
                 e['requested_revision'] += 1
+                e['explicit_revision'] += 1
+                e['force_check'] = True
                 target = e['requested_revision']
                 e['next_check'] = 0
                 self.cv.notify_all()
@@ -505,19 +563,24 @@ class Coordinator:
                 moment = time.monotonic()
                 for e in self.entries.values():
                     e['leases'] = {k: v for k, v in e['leases'].items() if v > moment}
-                pending = [(k, e['requested_revision'] > e['published_revision']) for k, e in self.entries.items()
+                pending = [k for k, e in self.entries.items()
                            if self.active(e) and moment >= e['next_check']
                            and (self.config.sync.get('enabled', True) or e.get('manual_sync'))]
-            for key, forced in pending:
+            for key in pending:
                 if self.stop.is_set():
                     break
+                with self.cv:
+                    before_explicit = self.entries[key]['explicit_revision']
+                    forced = self.entries[key].get('force_check', False)
                 self.check(key, force=forced)
                 with self.cv:
                     e = self.entries[key]
-                    newer_request = e['requested_revision'] > max(e['published_revision'], e.get('failed_revision', -1))
-                    if newer_request:
+                    # A request that arrived during the pass must not be lost;
+                    # an ordinary content revision keeps its own debounce time.
+                    if e['explicit_revision'] > before_explicit:
                         e['next_check'] = 0
                     else:
+                        e['force_check'] = False
                         e['manual_sync'] = False
             self.stop.wait(.25)
 

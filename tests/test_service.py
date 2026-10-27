@@ -98,6 +98,22 @@ include=["*.c"]
         self.assertEqual(SearchService(self.config.data_dir).load_composition(first)['composition_hash'],
                          original_hash)
 
+    def test_unchanged_pass_does_not_publish_a_newer_pending_request(self):
+        entry = self.register()
+        from bubbleteait import service as service_module
+        original = service_module.load_project
+        def load_with_request(path):
+            project = original(path)
+            with self.coordinator.cv:
+                self.coordinator.entries[str(self.project)]['requested_revision'] += 1
+            return project
+        with patch('bubbleteait.service.load_project', side_effect=load_with_request):
+            self.coordinator.check(str(self.project), force=True)
+        self.assertEqual(entry['state'], 'ready')
+        # The pass covered the old fingerprint. A request that arrived while it
+        # was being planned must keep waiting for the next pass.
+        self.assertLess(entry['published_revision'], entry['requested_revision'])
+
     def test_backend_failure_and_mid_build_edit_do_not_publish_partial_composition(self):
         first = self.register()['composition_id']
         (self.project / 'main.c').write_text('int changed;\n')
@@ -106,12 +122,83 @@ include=["*.c"]
         self.assertEqual(self.coordinator.entries[str(self.project)]['state'], 'error')
         self.assertEqual(self.coordinator.entries[str(self.project)]['composition_id'], first)
         self.backend.fail = False
-        self.backend.after_index = lambda: (self.project / 'main.c').write_text('int changed_again;\n')
+        writes = {'n': 0}
+        def edit_during_every_attempt():
+            writes['n'] += 1
+            (self.project / 'main.c').write_text(f'int changed_{writes["n"]};\n', encoding='utf-8')
+        self.backend.after_index = edit_during_every_attempt
         self.coordinator.check(str(self.project), force=True)
+        # The single retry also sees a new revision, so the persistent writer
+        # ends in an explicit error instead of publishing a moving snapshot.
         self.assertIn('Source changed during sync', self.coordinator.entries[str(self.project)]['error'])
+        self.assertEqual(self.coordinator.entries[str(self.project)]['composition_id'], first)
         self.backend.after_index = None
         self.coordinator.check(str(self.project), force=True)
         self.assertEqual(self.coordinator.entries[str(self.project)]['state'], 'ready')
+
+    def test_check_retries_a_single_mid_build_change_and_bumps_revision(self):
+        entry = self.register()
+        before = entry['requested_revision']
+        (self.project / 'main.c').write_text('int threshold = 42;\n', encoding='utf-8')
+        changed = {'done': False}
+        def change_once():
+            if not changed['done']:
+                changed['done'] = True
+                (self.project / 'main.c').write_text('int threshold = 43;\n', encoding='utf-8')
+        self.backend.after_index = change_once
+        self.coordinator.check(str(self.project), force=True)
+        self.assertEqual(entry['state'], 'ready', entry)
+        self.assertGreater(entry['requested_revision'], before)
+        self.assertGreaterEqual(entry['published_revision'], entry['requested_revision'])
+        unit = SearchService(self.config.data_dir).load_composition(entry['composition_id'])['units'][0]['unit_id']
+        content = (self.config.data_dir / 'sources' / unit / 'files/main.c').read_text(encoding='utf-8')
+        self.assertIn('43', content)
+
+    def test_debounce_counts_one_detected_change_once(self):
+        self.coordinator.config = replace(self.config, sync={'debounce_ms': 1000})
+        entry = self.register()
+        before = entry['requested_revision']
+        (self.project / 'main.c').write_text('int threshold = 42;\n', encoding='utf-8')
+        self.coordinator.check(str(self.project), force=False)
+        self.assertEqual(entry['state'], 'pending')
+        self.assertEqual(entry['requested_revision'], before + 1)
+        self.coordinator.check(str(self.project), force=True)
+        self.assertEqual(entry['state'], 'ready')
+        self.assertEqual(entry['requested_revision'], before + 1)
+
+    def test_confirm_unchanged_preserves_a_newer_request_schedule(self):
+        entry = self.register()
+        target = entry['published_revision']
+        entry['requested_revision'] = target + 1
+        self.assertTrue(self.coordinator._confirm_unchanged(str(self.project), target))
+        self.assertEqual(entry['next_check'], 0)
+        self.assertFalse(entry['force_check'])
+        self.assertFalse(entry.get('manual_sync'))
+
+    def test_check_retries_a_transient_oserror_before_reporting_error(self):
+        entry = self.register()
+        from bubbleteait import service as service_module
+        original = service_module.load_project
+        state = {'failed': False}
+        def flaky(path):
+            if not state['failed']:
+                state['failed'] = True
+                raise FileNotFoundError('transient source replacement')
+            return original(path)
+        with patch('bubbleteait.service.load_project', side_effect=flaky):
+            self.coordinator.check(str(self.project), force=True)
+        self.assertEqual(entry['state'], 'ready', entry)
+
+    def test_permanent_oserror_is_not_retried(self):
+        entry = self.register()
+        calls = []
+        def denied(path):
+            calls.append(path)
+            raise PermissionError('permanent source denial')
+        with patch('bubbleteait.service.load_project', side_effect=denied):
+            self.coordinator.check(str(self.project), force=True)
+        self.assertEqual(entry['state'], 'error')
+        self.assertEqual(len(calls), 1)
 
     def test_registration_is_exact_persistent_and_conflicting_names_are_rejected(self):
         self.register()
@@ -198,6 +285,26 @@ include=["*.c"]
             with self.assertRaises(SearchError):
                 direct.read_many([request])
 
+    def test_path_errors_distinguish_exclusion_pending_and_outside_sources(self):
+        (self.project / '.gitignore').write_text('secret.c\n', encoding='utf-8')
+        (self.project / 'secret.c').write_text('int secret;\n', encoding='utf-8')
+        entry = self.register()
+        direct = DirectService(self.config, entry['composition_id'])
+        with self.assertRaisesRegex(SearchError, 'excluded: gitignore'):
+            direct.read_many([{'path': 'secret.c'}])
+        (self.project / 'notes.txt').write_text('not included by *.c\n', encoding='utf-8')
+        with self.assertRaisesRegex(SearchError, 'excluded: not_included'):
+            direct.read_many([{'path': 'notes.txt'}])
+        (self.project / 'new.c').write_text('int new_value;\n', encoding='utf-8')
+        with self.assertRaisesRegex(SearchError, 'sync_pending'):
+            direct.read_many([{'path': 'new.c'}])
+        outside = self.root / 'outside.c'
+        outside.write_text('int outside;\n', encoding='utf-8')
+        with self.assertRaisesRegex(SearchError, 'outside_sources'):
+            direct.read_many([{'path': str(outside)}])
+        with self.assertRaisesRegex(SearchError, 'Unknown direct source_id'):
+            direct.read_many([{'source_id': 'missing', 'path': 'main.c'}])
+
     def test_session_ids_survive_new_composition_and_cache_eviction(self):
         entry = self.register()
         first = entry['composition_id']
@@ -249,6 +356,9 @@ path="workspace"
         config = load_config(self.root, config_path=settings, env={})
         self.assertEqual(config.data_dir, self.root / 'storage')
         self.assertEqual(config.qwen.model_profile, 'q06')
+        self.assertEqual(config.origins['data_dir'], str(settings))
+        self.assertEqual(config.origins['sync'], str(settings))
+        self.assertEqual(config.origins['workspaces'], str(settings))
         self.assertEqual(config, config_from_payload(config_payload(config)))
         settings.write_text(settings.read_text() + '\n[embedding.profiles.alternative]\nbackend="qwen-dense"\nmodel_path="models/alternative"\n')
         alternative = select_profile(load_config(self.root, config_path=settings, env={}), 'alternative')
@@ -256,6 +366,7 @@ path="workspace"
         self.assertEqual(alternative.embedding_profile, 'alternative')
         overridden = load_config(self.root, config_path=settings, env={'BTI_DATA_DIR': str(self.root / 'override')})
         self.assertEqual(overridden.data_dir, self.root / 'override')
+        self.assertEqual(overridden.origins['data_dir'], 'env:BTI_DATA_DIR')
         settings.write_text(settings.read_text().replace('backend="qwen-dense"', 'backend="made-up"'))
         with self.assertRaisesRegex(ConfigError, 'unsupported backend'):
             load_config(self.root, config_path=settings, env={})

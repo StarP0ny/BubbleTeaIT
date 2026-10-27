@@ -211,12 +211,12 @@ class GitIgnoreTests(unittest.TestCase):
         original = self.registry._inventory
         calls = 0
 
-        def inventory(spec):
+        def inventory(spec, **kwargs):
             nonlocal calls
             calls += 1
             if calls == 2:
                 rules.write_text("local/\n# changed during capture\n", encoding="utf-8")
-            return original(spec)
+            return original(spec, **kwargs)
 
         with patch.object(self.registry, "_inventory", side_effect=inventory):
             with self.assertRaises(SnapshotChangedError):

@@ -42,6 +42,22 @@ class ServiceCLITests(unittest.TestCase):
         self.assertIn('state: pending', output)
         self.client.request.assert_called_once_with('register', path=str(self.root))
 
+    def test_watch_list_text_shows_observation_reasons(self):
+        self.client.request.return_value = {'state': 'running', 'projects': [{
+            'project': 'app', 'path': str(self.root), 'state': 'ready',
+            'manual': True, 'workspaces': ['work'], 'temporary_clients': 2, 'watching': True}]}
+        code, output = self.run_cli(['--project-dir', str(self.root), 'watch', '--list'])
+        self.assertEqual(code, 0, output)
+        self.assertIn('Watching', output)
+        self.assertIn('work', output)
+        self.assertIn('\tyes\t', output)
+        self.assertIn('\t2', output)
+        self.client.request.return_value['sync_enabled'] = False
+        code, output = self.run_cli(['--project-dir', str(self.root), 'watch', '--list'])
+        self.assertEqual(code, 0, output)
+        self.assertIn('sync disabled', output)
+        self.assertIn('\tpaused\t', output)
+
     def test_missing_local_config_does_not_watch_parent(self):
         child = self.root / 'child'
         child.mkdir()

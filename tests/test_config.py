@@ -19,8 +19,8 @@ class ConfigTests(unittest.TestCase):
         return path
 
     def test_each_layer_resolves_paths_relative_to_its_own_file(self):
-        self.write("configs/bti.toml", '[paths]\ndata_dir="../shared-data"\nmodels_dir="../shared-models"\n[models.e5]\npath="../weights/e5"\nrequired=true\n[llm]\nbase_url="http://localhost:9931/v1"\nmodel="original"\n')
-        self.write(".local/config.toml", '[paths]\nmodels_dir="../local-models"\n[models.e5]\nrequired=false\n[llm]\nmodel="override"\n')
+        base = self.write("configs/bti.toml", '[paths]\ndata_dir="../shared-data"\nmodels_dir="../shared-models"\n[models.e5]\npath="../weights/e5"\nrequired=true\n[llm]\nbase_url="http://localhost:9931/v1"\nmodel="original"\n')
+        local = self.write(".local/config.toml", '[paths]\nmodels_dir="../local-models"\n[models.e5]\nrequired=false\n[llm]\nmodel="override"\n')
         config = load_config(self.root, env={})
         self.assertEqual(config.data_dir, self.root / "shared-data")
         self.assertEqual(config.models_dir, self.root / "local-models")
@@ -28,6 +28,13 @@ class ConfigTests(unittest.TestCase):
         self.assertFalse(config.models[0].required)
         self.assertEqual(config.llm.model, "override")
         self.assertEqual(len(config.loaded_files), 2)
+        self.assertEqual(config.origins["paths.data_dir"], str(base))
+        self.assertEqual(config.origins["paths.models_dir"], str(local))
+        self.assertEqual(config.origins["data_dir"], str(base))
+        self.assertEqual(config.origins["models_dir"], str(local))
+        self.assertEqual(config.origins["llm.model"], str(local))
+        self.assertEqual(config.sync["poll_interval_seconds"], 10)
+        self.assertEqual(config.origins["sync"], "built-in")
 
     def test_environment_overrides_paths_and_default_model_locations(self):
         self.write("configs/bti.toml", '[paths]\nmodels_dir="../ignored"\n[models.e5]\nfiles=["config.json"]\n')

@@ -31,12 +31,12 @@ class Project:
     config_hash: str
     context: dict
 
-    def plan(self, data_dir) -> dict:
+    def plan(self, data_dir, *, refresh: bool = False) -> dict:
         registry = Registry(data_dir)
         selections = []
         owners = {}
         for spec in self.sources:
-            selection = registry.preview(spec)
+            selection = registry.preview(spec, refresh=refresh)
             selection['selection'] = asdict(spec) | {'root': str(spec.root)}
             for entry in selection['files']:
                 path = (spec.root / entry['path']).resolve()
@@ -182,7 +182,7 @@ def sync_project(project, config, recipe, backend, *, plan=None):
 
 
 def _sync_project(project, config, recipe, backend, *, plan=None):
-    plan = project.plan(config.data_dir) if plan is None else plan
+    plan = project.plan(config.data_dir, refresh=True) if plan is None else plan
     if plan['config_hash'] != project.config_hash or not plan['ready']:
         raise ConfigError('Project preflight failed; inspect bti plan before indexing')
     registry = Registry(config.data_dir)
@@ -200,7 +200,7 @@ def _sync_project(project, config, recipe, backend, *, plan=None):
         raise ConfigError('Project configuration changed during sync; previous composition retained')
     # Indexing may take minutes. Recheck every selected source, including earlier units,
     # before changing the published alias. New/deleted files matter as much as edits.
-    current = project.plan(config.data_dir)
+    current = project.plan(config.data_dir, refresh=True)
     if [s['files'] for s in current['sources']] != [s['files'] for s in plan['sources']]:
         raise ConfigError('Source changed during sync; previous composition retained; retry')
     if load_project(project.path).config_hash != project.config_hash:

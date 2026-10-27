@@ -111,6 +111,7 @@ class Config:
     embedding_override: str | None = None
     sync_overrides: dict = field(default_factory=dict)
     embedding_profiles: dict = field(default_factory=dict)
+    origins: dict = field(default_factory=dict)
 
 
 def _string(value: Any, key: str) -> str:
@@ -311,6 +312,7 @@ def load_config(
     local = _path(str(local_config_path), root, env, "local-config") if local_config_path is not None else root / ".local/config.toml"
     merged: dict[str, Any] = {}
     loaded: list[Path] = []
+    origins: dict[str, str] = {}
     user_config = (Path(env['LOCALAPPDATA']) / 'BubbleTeaIT/config.toml' if 'LOCALAPPDATA' in env else
                    Path(env['XDG_CONFIG_HOME']) / 'bubbleteait/config.toml' if 'XDG_CONFIG_HOME' in env else None)
     service_file = user_config.with_name('config-service.toml') if user_config is not None else None
@@ -326,22 +328,39 @@ def load_config(
         layers = ([(user_config, False)] if user_config is not None else []) + [(shared, config_path is not None), (local, local_config_path is not None)]
     for path, explicit in layers:
         if path.exists() or explicit:
-            _merge(merged, _read(path, env))
+            layer = _read(path, env)
+            _merge(merged, layer)
             loaded.append(path)
+            for key, value in layer.items():
+                if isinstance(value, dict):
+                    for subkey in value:
+                        origins[f'{key}.{subkey}'] = str(path)
+                origins[key] = str(path)
 
     paths = merged.get("paths", {})
     if "BTI_DATA_DIR" in env:
         default_data = _path(env["BTI_DATA_DIR"], root, env, "BTI_DATA_DIR")
+        origins["data_dir"] = "env:BTI_DATA_DIR"
     elif "data_dir" in paths:
         default_data = paths["data_dir"]
+        origins["data_dir"] = origins.get("paths.data_dir", origins.get("paths", "built-in"))
     elif "LOCALAPPDATA" in env:
         default_data = Path(env["LOCALAPPDATA"]) / "BubbleTeaIT"
+        origins["data_dir"] = "built-in"
     elif "XDG_DATA_HOME" in env:
         default_data = Path(env["XDG_DATA_HOME"]) / "bubbleteait"
+        origins["data_dir"] = "built-in"
     else:
         default_data = Path.home() / ".local/share/bubbleteait"
+        origins["data_dir"] = "built-in"
     data_dir = default_data.resolve()
-    models_dir = _path(env["BTI_MODELS_DIR"], root, env, "BTI_MODELS_DIR") if "BTI_MODELS_DIR" in env else paths.get("models_dir", data_dir / "models")
+    if "BTI_MODELS_DIR" in env:
+        models_dir = _path(env["BTI_MODELS_DIR"], root, env, "BTI_MODELS_DIR")
+        origins["models_dir"] = "env:BTI_MODELS_DIR"
+    else:
+        models_dir = paths.get("models_dir", data_dir / "models")
+        origins["models_dir"] = (origins.get("paths.models_dir", origins.get("paths", "built-in"))
+                                 if "models_dir" in paths else "built-in")
 
     models: list[ModelConfig] = []
     for name, item in merged.get("models", {}).items():
@@ -426,8 +445,20 @@ def load_config(
         if not isinstance(clangd, Path):
             raise ConfigError("symbols.clangd_path: expected an explicit executable path")
         symbols = SymbolsConfig(_string(item.get("executable"), "symbols.executable"), clangd, float(timeout))
+    for source_key, target_key in (('backends.qwen', 'qwen'), ('backends.cocoindex', 'cocoindex'),
+                                   ('embedding.default_profile', 'embedding_profile'),
+                                   ('embedding.profiles', 'embedding_profiles')):
+        if source_key in origins:
+            origins[target_key] = origins[source_key]
+    for section in ('sync', 'workspaces', 'models', 'embedding', 'backends'):
+        origins.setdefault(section, 'built-in')
+    if manifest is not None:
+        origins['project_config'] = str(manifest)
+    sync = {'enabled': True, 'debounce_ms': 2000, 'poll_interval_seconds': 10,
+            'reconcile_interval_seconds': 60, **merged.get('sync', {})}
     return Config(root, data_dir, models_dir, tuple(models), llm, tuple(mcp), tuple(loaded),
                   selected_backends.get("cocoindex"), selected_backends.get("qwen"), research, symbols, manifest,
-                  service_file, merged.get('sync', {}), merged.get('workspaces', {}),
+                  service_file, sync, merged.get('workspaces', {}),
                   merged.get('embedding', {}).get('default_profile'),
-                  embedding_profiles=merged.get('embedding', {}).get('profiles', {}))
+                  embedding_profiles=merged.get('embedding', {}).get('profiles', {}),
+                  origins=origins)

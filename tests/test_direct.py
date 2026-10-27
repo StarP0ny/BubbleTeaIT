@@ -466,6 +466,36 @@ class DirectTests(unittest.TestCase):
         with self.assertRaises(RegistryError):
             direct.read_many([result['excerpts'][0]['id']])
 
+    def test_ambiguous_path_lists_short_source_candidates(self):
+        parent = self.unit('parent', {'src/shared.c': 'int shared;\n'})
+        root = self.root / 'parent'
+        self.registry.register(SourceSpec('copy', 'module', root))
+        copy = self.registry.snapshot('copy', self.recipe)
+        status = self.registry.data_dir / 'indexes' / copy['unit_id'] / 'status.json'
+        status.parent.mkdir(parents=True, exist_ok=True)
+        status.write_text(json.dumps({'schema_version': 1, 'unit_id': copy['unit_id'],
+            'recipe_hash': copy['recipe_hash'], 'backend': 'cocoindex-code', 'status': 'ready'}), encoding='utf-8')
+        direct = self.direct(parent, copy)
+        with self.assertRaises(SearchError) as raised:
+            direct.read_many([{'path': str(root / 'src/shared.c')}])
+        message = str(raised.exception)
+        self.assertIn('ambiguous_path', message)
+        self.assertIn('parent:src/shared.c', message)
+        self.assertIn('copy:src/shared.c', message)
+
+    def test_nested_source_root_wins_over_its_parent(self):
+        parent = self.unit('parent', {'src/shared.c': 'int shared;\n'})
+        child_root = self.root / 'parent/src'
+        self.registry.register(SourceSpec('child', 'module', child_root))
+        child = self.registry.snapshot('child', self.recipe)
+        status = self.registry.data_dir / 'indexes' / child['unit_id'] / 'status.json'
+        status.parent.mkdir(parents=True, exist_ok=True)
+        status.write_text(json.dumps({'schema_version': 1, 'unit_id': child['unit_id'],
+            'recipe_hash': child['recipe_hash'], 'backend': 'cocoindex-code', 'status': 'ready'}), encoding='utf-8')
+        direct = self.direct(parent, child)
+        with self.assertRaisesRegex(SearchError, r'not_found'):
+            direct.read_many([{'path': str(child_root / 'new.c')}])
+
     def test_backend_forged_content_and_path_filter_violation_fail_closed(self):
         unit = self.unit('code', {'a.c': 'int needle;\n', 'b.c': 'int other;\n'})
         direct = self.direct(unit)
