@@ -18,7 +18,11 @@ from .service import Coordinator, config_from_payload, config_payload
 def serve(launch):
     data = json.loads(Path(launch).read_text(encoding='utf-8'))
     config = config_from_payload(data['config'])
-    coordinator = Coordinator(config)
+    if config.engines:
+        from .engine_coordinator import EngineCoordinator
+        coordinator = EngineCoordinator(config)
+    else:
+        coordinator = Coordinator(config)
     directory = config.data_dir / 'runtime/service'
     with file_lock(directory / 'service.lock'):
         class Handler(BaseHTTPRequestHandler):
@@ -44,6 +48,8 @@ def serve(launch):
                                   'error': coordinator.config_error}
                     elif action == 'workspace_projects':
                         result = coordinator.workspace_projects(request['workspace'])
+                    elif action == 'engine' and config.engines:
+                        result = coordinator.engine_call(request)
                     elif action == 'register':
                         result = coordinator.register(request['path'], manual=True)
                     elif action == 'unwatch':
@@ -91,6 +97,8 @@ def serve(launch):
                 coordinator.cv.notify_all()
             # Hold the writer identity until an in-flight immutable build has finished.
             coordinator.thread.join()
+            if hasattr(coordinator, 'close'):
+                coordinator.close()
             server.server_close()
             if state_file.exists() and json.loads(state_file.read_text())['token'] == data['token']:
                 state_file.unlink()

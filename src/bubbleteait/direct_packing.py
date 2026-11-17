@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import PurePosixPath
 
 from .search import SearchError
 
@@ -15,12 +16,20 @@ def size(value):
     return len(json.dumps(value, ensure_ascii=False, separators=(',', ':')))
 
 
-def _centred(value, width):
+def _document(path):
+    return PurePosixPath(path).suffix.casefold() in {'.md', '.markdown', '.rst', '.txt', '.adoc'}
+
+
+def _window(value, width, *, prefer_start=False):
     first, last = value['start_line'], value['end_line']
     width = min(width, last - first + 1)
-    seed_first, seed_last = value['_seed']
-    centre = (seed_first + seed_last) // 2
-    start = max(first, min(centre - (width - 1) // 2, last - width + 1))
+    if prefer_start:
+        section = value.get('_section', (first, last))[0]
+        start = max(first, min(section, last - width + 1))
+    else:
+        seed_first, seed_last = value['_seed']
+        centre = (seed_first + seed_last) // 2
+        start = max(first, min(centre - (width - 1) // 2, last - width + 1))
     return start, start + width - 1
 
 
@@ -116,8 +125,13 @@ def pack_context(direct, reads, max_chars, *, include_catalog=True, candidate_fi
                         continue
                     first, last = (value['_seed'] if value.get('_allow_fit') else
                                    (value['start_line'], value['end_line']))
+                    # Repeating an unreadable 120-line range makes the advice
+                    # useless at the same budget. Offer a smaller executable
+                    # prefix that includes the start of the requested window.
+                    width = 32 if value.get('_allow_fit') else 48
                     request = {'source_id': direct.aliases[value['source_id']],
-                               'path': value['file_path'], 'start': first, 'end': min(last, first + 119)}
+                               'path': value['file_path'], 'start': first,
+                               'end': min(last, first + width - 1)}
                     if size(advice + [request]) <= max_chars // 8:
                         advice.append(request)
                 result['omitted_reads'] = advice
@@ -139,16 +153,24 @@ def pack_context(direct, reads, max_chars, *, include_catalog=True, candidate_fi
             options = [(value['start_line'], value['end_line'])]
         else:
             target = 7
-            options = [_centred(value, target)]
+            # A whole Markdown section starts with its heading and the first
+            # paragraphs. Centring a narrow admission window in the middle of
+            # that section can skip the defining sentence entirely.
+            seed_first, seed_last = value['_seed']
+            prefer_start = _document(value['file_path']) and seed_last - seed_first >= 6
+            options = [_window(value, target, prefer_start=prefer_start)]
+            if value.get('_variant_priority') and value['end_line'] - value['start_line'] < 64:
+                options.insert(0, (value['start_line'], value['end_line']))
             # An admission window should not reserve a large semantic chunk
             # before later hits get any space. Three source lines are the
             # minimum fallback for a multi-line parent with competitors.
-            options.append(_centred(value, 3))
+            options.append(_window(value, 3, prefer_start=prefer_start))
             # A narrow fallback is useful for an intrinsically large line or
             # a single semantic hit. Never spend a tail on a bare one-liner
             # from a multi-line parent while other candidates compete.
             if len(reads) == 1:
-                options = [_centred(value, width) for width in (7, 5, 3, 1)]
+                options = [_window(value, width, prefer_start=prefer_start)
+                           for width in (7, 5, 3, 1)]
         for span in dict.fromkeys(options):
             proposed = {**spans, index: span}
             if size(render(proposed)[0]) <= max_chars:
@@ -161,7 +183,7 @@ def pack_context(direct, reads, max_chars, *, include_catalog=True, candidate_fi
     changed = True
     while changed:
         changed = False
-        for index in list(spans):
+        for index in sorted(spans, key=lambda item: (not reads[item].get('_variant_priority'), item)):
             value = reads[index]
             if not value.get('_allow_fit'):
                 continue

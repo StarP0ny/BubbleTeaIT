@@ -77,8 +77,7 @@ def _unit_lock(path: Path):
 class CocoIndexBackend:
     """Blocking adapter; CLI/MCP coordinator can run calls as background jobs.
 
-    ``worker_path`` defaults to this checkout's tools directory. Installed
-    distributions should configure the explicit path to the packaged checkout.
+    ``worker_path`` defaults to the standalone launcher included in the distribution.
     ``models_dir`` should be the configured BTI_MODELS_DIR (E:\\models locally).
     """
 
@@ -96,7 +95,7 @@ class CocoIndexBackend:
         self.models_dir = Path(models_dir).resolve() if models_dir is not None else self.model_path.parent
         if not self.model_path.is_relative_to(self.models_dir):
             raise BackendError("Model directory must be contained in models_dir")
-        self.worker_path = Path(worker_path).resolve() if worker_path is not None else Path(__file__).resolve().parents[3] / "tools/cocoindex_worker.py"
+        self.worker_path = Path(worker_path).resolve() if worker_path is not None else Path(__file__).resolve().parents[1] / "_workers/cocoindex_worker.py"
         if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
             raise BackendError("timeout_seconds must be positive and finite")
         self.timeout_seconds = timeout_seconds

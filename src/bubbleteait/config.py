@@ -112,6 +112,9 @@ class Config:
     sync_overrides: dict = field(default_factory=dict)
     embedding_profiles: dict = field(default_factory=dict)
     origins: dict = field(default_factory=dict)
+    engines: dict = field(default_factory=dict)
+    projects: dict = field(default_factory=dict)
+    engine_overrides: dict = field(default_factory=dict)
 
 
 def _string(value: Any, key: str) -> str:
@@ -186,7 +189,7 @@ def _read(path: Path, env: Mapping[str, str]) -> dict[str, Any]:
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise ConfigError(f"Cannot load {path}: {exc}") from exc
     _table(raw, str(path), {"paths", "models", "llm", "mcp", "backends", "research", "symbols",
-                           "service", "sync", "embedding", "workspaces"})
+                           "service", "sync", "embedding", "workspaces", "engines", "projects"})
     if 'service' in raw:
         item = _table(raw['service'], 'service', {'data_dir'})
         raw.setdefault('paths', {}).update(item)
@@ -227,7 +230,7 @@ def _read(path: Path, env: Mapping[str, str]) -> dict[str, Any]:
         for name, entry in raw['workspaces'].items():
             if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', name):
                 raise ConfigError('Invalid workspace name')
-            item = _table(entry, f'workspaces.{name}', {'path', 'discover', 'exclude', 'watch'})
+            item = _table(entry, f'workspaces.{name}', {'path', 'discover', 'exclude', 'watch', 'projects', 'default_project'})
             item['path'] = _path(item.get('path'), path.parent, env, f'workspaces.{name}.path')
             for key, default in [('discover', ['*/bti.toml']), ('exclude', [])]:
                 patterns = _strings(item.get(key, default), f'workspaces.{name}.{key}')
@@ -289,6 +292,9 @@ def _read(path: Path, env: Mapping[str, str]) -> dict[str, Any]:
         item['python_executable'] = (str(_path(command, path.parent, env, f'embedding.profiles.{name}.python_executable'))
                                      if '/' in command or '\\' in command else command)
         item['model_path'] = raw['models'][name]['path']
+    if 'engines' in raw or 'projects' in raw:
+        from .engine_config import read_engine_settings
+        read_engine_settings(raw, path, env)
     return raw
 
 
@@ -319,8 +325,12 @@ def load_config(
     if config_path is not None:
         # An explicitly selected new service config is authoritative; legacy configs retain their layers.
         candidate = _read(shared, env)
-        if any(key in candidate for key in ('service', 'embedding', 'sync', 'workspaces')) or shared.name == 'config-service.toml':
+        if any(key in candidate for key in ('service', 'embedding', 'sync', 'workspaces', 'engines', 'projects')) or shared.name == 'config-service.toml':
             service_file = shared
+        else:
+            # An explicit legacy config must remain usable after installing a
+            # default machine coordinator config (including historical indexes).
+            service_file = None
     if service_file is not None and service_file.exists():
         layers = [(service_file, True)]
     else:
@@ -461,4 +471,4 @@ def load_config(
                   service_file, sync, merged.get('workspaces', {}),
                   merged.get('embedding', {}).get('default_profile'),
                   embedding_profiles=merged.get('embedding', {}).get('profiles', {}),
-                  origins=origins)
+                  origins=origins, engines=merged.get('engines', {}), projects=merged.get('projects', {}))

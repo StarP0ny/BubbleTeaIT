@@ -52,7 +52,7 @@ def _query_terms(query):
         if term in _FUNCTION_WORDS or len(term) < 2:
             continue
         terms.add(term)
-        if not (len(token) == 2 and token.isupper()) and (term in quoted or '_' in token or re.search(r'[a-z][A-Z]', token)
+        if not (len(token) == 2 and token.isalpha() and token.isupper()) and (term in quoted or '_' in token or re.search(r'[a-z][A-Z]', token)
                 or len(token) > 2 and token.isupper() and any(c.isalpha() for c in token)
                 or any(c.isdigit() for c in token) and any(c.isalpha() for c in token)):
             identifiers.add(term)
@@ -84,6 +84,35 @@ def _query_intents(query):
             return any(word.startswith(term) for word in words)
         return any(word == term or word == term + 's' for word in words)
     return {role for role, terms in _ROLE_TERMS.items() if any(matches(term) for term in terms)}
+
+
+def _query_variants(query, values):
+    if values is None:
+        return []
+    if not isinstance(values, list) or not 1 <= len(values) <= 3:
+        raise SearchError('query_variants must be an array of one to three strings')
+    variants, seen = [], {query.casefold()}
+    for value in values:
+        if not isinstance(value, str) or not value.strip() or len(value) > 4000:
+            raise SearchError('Each query variant must be a nonempty string of at most 4000 characters')
+        if value.casefold() not in seen:
+            seen.add(value.casefold())
+            variants.append(value)
+    return variants
+
+
+def _fused_rows(rows_by_query):
+    """RRF-fuse ranked rows without comparing backend scores across queries."""
+    best = {}
+    for rows in rows_by_query:
+        for rank, row in enumerate(rows, 1):
+            key = row['unit_id'], row['file_path'], row['start_line'], row['end_line']
+            score = 1 / (60 + rank)
+            if key not in best or score > best[key][0]:
+                best[key] = (score, row)
+    return [row for _, row in sorted(best.values(), key=lambda item: (
+        -item[0], item[1]['unit_id'], item[1]['file_path'],
+        item[1]['start_line'], item[1]['end_line']))]
 
 
 def _metadata_labels(labels, source, path):
@@ -367,6 +396,7 @@ class DirectService:
         # available when expanded context would consume the entire JSON budget.
         value['_source_lines'] = lines
         value['_seed'] = (seed_start, seed_end)
+        value['_section'] = (start, end)
         value['_allow_fit'] = expand
         value['_context_truncated'] = not (start <= seed_start <= seed_end <= end)
         return value
@@ -490,16 +520,20 @@ class DirectService:
                           offset=offset, limit=limit, max_chars=max_chars)
 
     @_request
-    def search(self, query, limit=6, max_chars=12000, roles=None, source_ids=None, paths=None, include_catalog=True):
+    def search(self, query, limit=6, max_chars=12000, roles=None, source_ids=None, paths=None,
+               query_variants=None, include_catalog=True):
         """Retrieve with soft role intent; explicit filters define the scope.
 
         A source/path typed inside query remains a retrieval hint. Use the
         catalog source_id with source_ids=[...], paths=['src/file.c'] for exact
         focus; mention of another project never silently changes these filters.
+        Optional query_variants are searched independently and fused by RRF;
+        they are not hidden filters and do not alter evidence boundaries.
         """
         if type(limit) is not int or not 1 <= limit <= 20:
             raise SearchError('Direct limit must be an integer from 1 to 20')
         _pack_arguments(max_chars, include_catalog)
+        variants = _query_variants(query, query_variants)
         roles, source_ids = self._filters(roles, source_ids)
         registry_roles = [role for role in roles or [] if role not in {'code', 'tests', 'docs', 'reports'}]
         # Inferred roles may coexist within a unit, so apply those after source validation.
@@ -508,11 +542,24 @@ class DirectService:
         with self._measure('vector_pipeline'):
             found = self.service.search(self.composition_id, query, channel='vector', limit=candidate_limit,
                                         roles=pre_roles, source_ids=source_ids, paths=paths)
+            variant_found = [self.service.search(self.composition_id, variant, channel='vector',
+                limit=candidate_limit, roles=pre_roles, source_ids=source_ids, paths=paths)['results']
+                for variant in variants]
         labels = _query_labels(query)
         intents = _query_intents(query)
         routed = (self._routed_reports(query, labels, min(16, candidate_limit), pre_roles, source_ids, paths)
                   if not intents or 'reports' in intents else [])
-        groups = [routed + found['results'], self._lexical(query, candidate_limit, pre_roles, source_ids, paths)]
+        variant_top = {(row['unit_id'], row['file_path'], row['start_line'], row['end_line'])
+                       for rows in variant_found for row in rows[:1]} if variants else set()
+        if variants:
+            vector_rows = _fused_rows([routed + found['results'], *variant_found])
+            lexical_rows = _fused_rows([
+                self._lexical(value, candidate_limit, pre_roles, source_ids, paths)
+                for value in (query, *variants)])
+        else:
+            vector_rows = routed + found['results']
+            lexical_rows = self._lexical(query, candidate_limit, pre_roles, source_ids, paths)
+        groups = [vector_rows, lexical_rows]
         if roles is not None:
             registry_roles = set(roles) - {'code', 'tests', 'docs', 'reports'}
             groups = [[row for row in rows if
@@ -527,13 +574,18 @@ class DirectService:
             for rank, row in enumerate(rows, 1):
                 category = _role(self.units[row['unit_id']], row['file_path'])
                 matches = _matches(terms, row['content'])
-                identifier_match = bool(matches & identifiers)
+                # A product/module label in the source identity scopes all of
+                # its files, even when that label is absent from a particular
+                # document body.
+                identifier_match = bool(matches & identifiers) or bool(
+                    _matches(identifiers, row['source_id'] + ' ' + row['file_path']))
                 if has_identifier_hits and not identifier_match and not (report_intent and category == 'reports'):
                     prose = terms - identifiers
                     if not prose or len(matches & prose) < min(2, len(prose)):
                         continue
                 key = row['unit_id'], row['file_path'], row['start_line'], row['end_line']
                 item = candidates.setdefault(key, {'row': row, 'votes': {}})
+                item['row']['_variant_top'] = key in variant_top
                 item['row']['_identifier_match'] = item['row'].get('_identifier_match', False) or identifier_match
                 item['row']['_labels'] = _metadata_labels(labels, row['source_id'], row['file_path'])
                 anchor_key = (not identifier_match, channel != 1, rank, row['end_line'] - row['start_line'])
@@ -547,6 +599,8 @@ class DirectService:
         lexical = [item for item in candidates.values() if 1 in item['votes']]
         merged = []
         for _, item in sorted(candidates.items()):
+            if item.get('_covered'):
+                continue
             row = item['row']
             overlaps = [entry for entry in lexical if entry is not item
                 and entry['row']['unit_id'] == row['unit_id']
@@ -554,6 +608,20 @@ class DirectService:
                 and row['start_line'] <= entry['row']['end_line']
                 and entry['row']['start_line'] <= row['end_line']]
             if 0 in item['votes'] and 1 not in item['votes'] and overlaps:
+                # A prose section is the better anchor when it fully contains
+                # its line-level lexical hits: the line may be only a scope
+                # label, while the section carries the actual answer. Keep
+                # lexical anchors outside that section independent.
+                contained = [entry for entry in overlaps
+                             if row['start_line'] <= entry['row']['start_line']
+                             and entry['row']['end_line'] <= row['end_line']] \
+                    if _role(self.units[row['unit_id']], row['file_path']) == 'docs' else []
+                if contained:
+                    item['votes'][1] = max(entry['votes'][1] for entry in contained)
+                    for entry in contained:
+                        entry['_covered'] = True
+                    merged.append(item)
+                    continue
                 for entry in overlaps:
                     entry['votes'][0] = max(entry['votes'].get(0, 0), item['votes'][0])
                 continue
@@ -566,6 +634,11 @@ class DirectService:
                 file = row['unit_id'], row['file_path']
                 role = _role(self.units[row['unit_id']], row['file_path'])
                 score = sum(item['votes'].values()) / (1 + 2 * files.get(file, 0) + .5 * categories.get(role, 0))
+                if row.get('_variant_top'):
+                    # Each explicitly supplied formulation contributes its best
+                    # anchor. RRF alone can bury a correct translation under a
+                    # repeated primary-query phrase from the same document.
+                    score *= 1.5
                 if has_identifier_hits and not row['_identifier_match']:
                     # Diversity must not promote an unrelated file merely to fill a role.
                     score *= .25
@@ -573,7 +646,11 @@ class DirectService:
                     score *= 2
                 if has_routed_reports and role == 'reports':
                     score *= 3 if row['_labels'] else .2
-                if row['_labels']:
+                # Label diversity applies to routed report families. A product
+                # or module label names the whole scope, not a set
+                # of interchangeable report groups, so it must not demote the
+                # second relevant document from that same scope.
+                if has_routed_reports and row['_labels']:
                     score /= 1 + .75 * min(label_counts.get(label, 0) for label in row['_labels'])
                 return -score, file, row['start_line'], row['end_line']
             merged.sort(key=priority)
@@ -584,6 +661,7 @@ class DirectService:
                    and previous['_seed'] == value['_seed'] for previous in selected):
                 continue
             selected.append(value)
+            value['_variant_priority'] = bool(row.get('_variant_top'))
             file = row['unit_id'], row['file_path']
             role = _role(self.units[row['unit_id']], row['file_path'])
             files[file], categories[role] = files.get(file, 0) + 1, categories.get(role, 0) + 1

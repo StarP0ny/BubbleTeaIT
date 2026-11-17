@@ -50,6 +50,15 @@ class QwenImportTests(unittest.TestCase):
         with self.assertRaises(BackendError):
             validate_recipe(wrong_type)
 
+    def test_legacy_and_section_v1_recipes_are_read_only_but_not_publishable(self):
+        from bubbleteait.backends.qwen import _recipe_kind, legacy_recipe, sections_v1_recipe
+        self.assertEqual(_recipe_kind(default_recipe()), 'sections-v2')
+        self.assertEqual(_recipe_kind(sections_v1_recipe()), 'sections-v1')
+        self.assertEqual(_recipe_kind(legacy_recipe()), 'lines')
+        for recipe in (legacy_recipe(), sections_v1_recipe()):
+            with self.assertRaisesRegex(BackendError, 'bti-sections-v2'):
+                validate_recipe(recipe)
+
 
 class FakeEncoder:
     def __init__(self):
@@ -166,6 +175,29 @@ class QwenStoreTests(unittest.TestCase):
             self.store.index(self.unit_id)
         self.assertEqual(len(self.encoder.document_calls), 1)
 
+    def test_stale_chunker_code_rebuilds_instead_of_failing(self):
+        import bubbleteait.backends.qwen as qwen_module
+        self.store.index(self.unit_id)
+        artifact = self.index_root / 'artifact'
+        manifest_path = artifact / 'manifest.json'
+        metadata = json.loads(manifest_path.read_text(encoding='utf-8'))
+        metadata['backend_code_sha256'] = '0' * 64
+        manifest_path.write_text(json.dumps(metadata), encoding='utf-8')
+        status_path = self.index_root / 'status.json'
+        status = json.loads(status_path.read_text(encoding='utf-8'))
+        status['artifact_manifest_sha256'] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        status_path.write_text(json.dumps(status), encoding='utf-8')
+        # A stale buildable artifact must not serve vectors built by old code.
+        with self.assertRaisesRegex(BackendError, 'stale'):
+            self.store.search(self.unit_id, 'cold')
+        result = self.store.index(self.unit_id)
+        self.assertEqual(result['status'], 'ready')
+        self.assertNotIn('reused', result)
+        self.assertEqual(len(self.encoder.document_calls), 2)
+        rebuilt = json.loads((artifact / 'manifest.json').read_text(encoding='utf-8'))
+        current = hashlib.sha256(Path(qwen_module.__file__).read_bytes()).hexdigest()
+        self.assertEqual(rebuilt['backend_code_sha256'], current)
+
     def test_filter_is_applied_before_topk_and_results_have_exact_source_proof(self):
         self.store.index(self.unit_id)
         self.assertEqual(self.store.search(self.unit_id, 'hot', limit=1)[0]['file_path'], 'a.c')
@@ -184,6 +216,95 @@ class QwenStoreTests(unittest.TestCase):
         composition = self.registry.compose('fixture-project', [self.unit_id], require_ready=True)
         result = SearchService(self.registry.data_dir, self.store).search('fixture-project', 'hot')
         self.assertEqual(result['state'], 'ready')
+
+    def test_markdown_h2_sections_do_not_cross_boundaries_or_lose_coverage(self):
+        text = ('# Guide\n\nIntro text.\n\n## First section\n\n'
+                + ''.join(f'first line {number}\n' for number in range(40))
+                + '\n## Second section\n\nsecond line\n')
+        (self.source / 'guide.md').write_text(text, encoding='utf-8')
+        self.refresh()
+        self.store.index(self.unit_id)
+        chunks = [json.loads(x) for x in (self.index_root / 'artifact/chunks.jsonl')
+                  .read_text(encoding='utf-8').splitlines() if 'guide.md' in x]
+        self.assertGreater(len(chunks), 1)
+        covered = set()
+        for chunk in chunks:
+            self.assertLessEqual(chunk['end_line'] - chunk['start_line'] + 1, 32)
+            covered.update(range(chunk['start_line'], chunk['end_line'] + 1))
+        self.assertEqual(covered, set(range(1, len(text.splitlines()) + 1)))
+        first = [chunk for chunk in chunks if '## First section' in chunk['content']]
+        second = [chunk for chunk in chunks if '## Second section' in chunk['content']]
+        self.assertTrue(first and second)
+        for chunk in first:
+            self.assertNotIn('## Second section', chunk['content'])
+        for chunk in second:
+            self.assertNotIn('## First section', chunk['content'])
+        self.assertTrue(all(chunk['start_line'] >= 5 for chunk in first))
+
+    def test_lone_h1_title_stays_with_first_h2_section(self):
+        text = '# Guide\n\n## First\n\ncontent\n'
+        (self.source / 'title.md').write_text(text, encoding='utf-8')
+        self.refresh()
+        self.store.index(self.unit_id)
+        chunks = [json.loads(x) for x in (self.index_root / 'artifact/chunks.jsonl')
+                  .read_text(encoding='utf-8').splitlines() if 'title.md' in x]
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0]['start_line'], 1)
+        self.assertIn('# Guide', chunks[0]['content'])
+        self.assertIn('## First', chunks[0]['content'])
+
+    def test_c_functions_split_at_top_level_boundaries(self):
+        text = ('#include "hot.h"\n'
+                '\n'
+                'int global_value = 7;\n'
+                '\n'
+                'void setHot(int v) {\n'
+                '    heat(v);\n'
+                '    heat(v + 1);\n'
+                '}\n'
+                '\n'
+                'int getHot(void)\n'
+                '{\n'
+                '    return global_value;\n'
+                '}\n')
+        (self.source / 'funcs.c').write_text(text, encoding='utf-8')
+        self.refresh()
+        self.store.index(self.unit_id)
+        chunks = [json.loads(x) for x in (self.index_root / 'artifact/chunks.jsonl')
+                  .read_text(encoding='utf-8').splitlines() if 'funcs.c' in x]
+        chunks.sort(key=lambda chunk: chunk['start_line'])
+        self.assertEqual([chunk['start_line'] for chunk in chunks], [1, 5, 10])
+        self.assertIn('#include', chunks[0]['content'])
+        self.assertNotIn('setHot', chunks[0]['content'])
+        self.assertIn('Функция: setHot', chunks[1]['embedding_text'])
+        self.assertNotIn('getHot', chunks[1]['content'])
+        self.assertIn('Функция: getHot', chunks[2]['embedding_text'])
+        self.assertIn('int getHot(void)', chunks[2]['content'])
+        covered = set()
+        for chunk in chunks:
+            covered.update(range(chunk['start_line'], chunk['end_line'] + 1))
+        self.assertEqual(covered, set(range(1, 14)))
+
+    def test_long_switch_splits_by_case_but_short_switch_stays_whole(self):
+        short = ['void pick(int k) {\n', '    switch (k) {\n',
+                 '    case 0: a(); break;\n', '    default: b(); break;\n',
+                 '    }\n', '}\n']
+        self.assertEqual(QwenIndexStore._c_function_spans(short, 32), [(1, 6)])
+        long_lines = ['void big(int k) {\n', '    switch (k) {\n']
+        for index in range(20):
+            long_lines.append(f'    case {index}:\n')
+            long_lines.append(f'        handle({index});\n')
+            long_lines.append('        break;\n')
+        long_lines += ['    default:\n', '    break;\n', '    }\n', '}\n']
+        spans = QwenIndexStore._c_function_spans(long_lines, 32)
+        self.assertEqual(spans[0], (1, 2))
+        self.assertEqual(spans[1], (3, 5))
+        self.assertEqual(spans[2], (6, 8))
+        self.assertEqual(spans[-1][1], len(long_lines))
+        covered = set()
+        for start, end in spans:
+            covered.update(range(start, end + 1))
+        self.assertEqual(covered, set(range(1, len(long_lines) + 1)))
 
     def test_token_budget_reduces_lines_without_gaps_or_silent_truncation(self):
         text = ''.join(f'int row{i:02d} = {i}; // ' + 'x' * 55 + '\n' for i in range(80))

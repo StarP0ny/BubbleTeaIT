@@ -120,6 +120,8 @@ def main(argv: list[str] | None = None) -> int:
             project_command.add_argument("--recipe", help="Explicit index recipe JSON")
             project_command.add_argument('--wait', action='store_true', help='Wait for the shared coordinator')
             project_command.add_argument('--timeout-ms', type=int, help='Total CLI wait limit; default waits until complete')
+            project_command.add_argument('--workspace', help='Workspace for coordinated live engines')
+            project_command.add_argument('--projects', nargs='+')
     doctor = commands.add_parser("doctor", help="Check configuration without launching models or MCP servers")
     doctor.add_argument("--json", action="store_true", help="Output structured JSON")
     doctor.add_argument("--probe-endpoints", action="store_true", help="Probe generation provider via GET /models; never request completion")
@@ -170,7 +172,9 @@ def main(argv: list[str] | None = None) -> int:
     search.add_argument('--max-chars', type=int, default=12000, help='Compact workspace response budget')
     symbols = commands.add_parser("symbols", help="Navigate pinned code with standalone read-only Serena, without LLMs")
     symbols.add_argument("--project", "--composition", dest="composition_id")
-    symbols.add_argument("--source-id", required=True)
+    symbols.add_argument("--source-id")
+    symbols.add_argument('--workspace')
+    symbols.add_argument('--project-name', help='Live project within the selected workspace')
     symbols.add_argument("--path", required=True)
     symbols.add_argument("--operation", choices=["overview", "definition", "references"], default="definition")
     symbols.add_argument("--name")
@@ -197,6 +201,15 @@ def main(argv: list[str] | None = None) -> int:
     read.add_argument("--mode", choices=["snapshot", "working"], default="snapshot")
     read.add_argument("--project", "--composition", dest="composition_id")
     read.add_argument("--json", action="store_true")
+    live_read = commands.add_parser('read', help='Read a current selected file through the coordinator, without embeddings')
+    live_read.add_argument('--path', required=True)
+    live_read.add_argument('--workspace')
+    live_read.add_argument('--project-name')
+    live_read.add_argument('--start-line', type=int, default=1)
+    live_read.add_argument('--end-line', type=int)
+    live_read.add_argument('--sha256', help='Reject a stale source locator')
+    live_read.add_argument('--max-chars', type=int, default=16000)
+    live_read.add_argument('--json', action='store_true')
     worker = commands.add_parser("worker", help="Control the configured persistent Qwen worker")
     worker_commands = worker.add_subparsers(dest="worker_command", required=True)
     for action in ("status", "load", "unload", "stop"):
@@ -204,6 +217,7 @@ def main(argv: list[str] | None = None) -> int:
         control.add_argument("--json", action="store_true")
     mcp = commands.add_parser("mcp", help="Run the stdio MCP facade (requires the mcp extra)")
     mcp.add_argument('--workspace', help='Configured workspace scope')
+    mcp.add_argument('--snapshots', action='store_true', help='Use the historical snapshot MCP even when live engines are configured')
     args = parser.parse_args(argv)
     try:
         configuration_root = (getattr(args, 'path', None) or args.project_dir
@@ -213,6 +227,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.command in {'service', 'watch', 'unwatch', 'workspace'}:
             from .service_cli import run
             return run(args, config)
+        if config.engines and not getattr(args, 'composition_id', None) and args.command in {
+                'search', 'symbols', 'read', 'plan', 'sync', 'project-info', 'list-files', 'list-sources', 'doctor'}:
+            if getattr(args, 'recipe', None):
+                raise ConfigError('--recipe belongs to legacy snapshot indexing, not coordinated live engines')
+            from .engine_cli import run
+            return run(args, config)
+        if args.command == 'read':
+            raise ConfigError('bti read requires configured engines; use read-source for legacy snapshots')
         if args.command == 'sync' and not args.recipe:
             if config.project_config is None:
                 raise ConfigError('No bti.toml found')
@@ -296,8 +318,10 @@ def main(argv: list[str] | None = None) -> int:
             args.composition_id = info['composition_id']
         if args.command == "mcp":
             try:
+                from dataclasses import replace
                 from .mcpserver import build_server
-                build_server(config, workspace=args.workspace).run(transport="stdio")
+                runtime = replace(config, engines={}, engine_overrides={}) if args.snapshots else config
+                build_server(runtime, workspace=args.workspace).run(transport="stdio")
             except ImportError as exc:
                 raise ConfigError("MCP dependencies are missing; install the 'mcp' extra") from exc
             return 0

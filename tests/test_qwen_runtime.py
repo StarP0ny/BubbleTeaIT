@@ -99,7 +99,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(other.request('health')['load_count'], 1)
         self.assertEqual(len(self.starts), 1)
         environment = self.starts[0][1]['env']
-        self.assertIn(str(Path(__file__).resolve().parents[1] / 'src'), environment['PYTHONPATH'])
+        self.assertEqual(environment.get('PYTHONPATH'), os.environ.get('PYTHONPATH'))
         self.client.request('unload')
         self.assertFalse(other.request('health')['resident'])
         other.request('load')
@@ -223,14 +223,13 @@ class WindowsJobLifecycleTests(unittest.TestCase):
             root = Path(temporary)
             data, models = root / 'data', root / 'models'
             client = QwenRuntimeClient(data, sys.executable, models / 'qwen', models_dir=models, timeout_seconds=30)
-            source = str(Path(__file__).resolve().parents[1] / 'src')
             # The short-lived MCP facade launches the real stdlib worker lazily;
             # no encoder.load or model files are required by this regression.
             code = ('import sys,json; from bubbleteait.qwen_runtime import QwenRuntimeClient; '
                 f'c=QwenRuntimeClient({str(data)!r},sys.executable,{str(models / "qwen")!r},models_dir={str(models)!r}); '
                 'c._start(); print(json.dumps({"jsonrpc":"2.0","method":"bti/worker-ready"}),flush=True); sys.stdin.read()')
             parameters = StdioServerParameters(command=sys.executable, args=['-X', 'utf8', '-c', code],
-                env=os.environ | {'PYTHONPATH': source}, cwd=source)
+                env=os.environ.copy(), cwd=str(root))
             async def exercise():
                 async with stdio_client(parameters) as (read, _):
                     self.assertTrue(windows_mcp._process_jobs, 'SDK must own a real kill-on-close Job')

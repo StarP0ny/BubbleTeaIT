@@ -219,6 +219,55 @@ class DirectTests(unittest.TestCase):
         filtered = direct.search('signal requirements', source_ids=['history'], roles=['primary_report'])
         self.assertEqual({hit['source'] for hit in filtered['excerpts']}, {'history'})
 
+    def test_product_label_in_source_scope_survives_identifier_gate(self):
+        docs = self.unit('x7.docs', {'persistent-data.md':
+            '# Persistent storage\n\nInternal Flash keeps CriticalData.\n'})
+        code = self.unit('x7.source', {'main.c': '// X7 startup\nint main(void) { return 0; }\n'})
+        self.backend.rows[docs['unit_id']] = [self.row(docs, 'persistent-data.md', 1, 3)]
+        self.backend.rows[code['unit_id']] = [self.row(code, 'main.c', 1, 2)]
+        direct = self.direct(docs, code)
+        result = direct.search('X7 сохраняет настройки между перезапусками', limit=2)
+        self.assertEqual({hit['path'] for hit in result['excerpts']},
+                         {'persistent-data.md', 'main.c'})
+
+    def test_document_admission_starts_at_section_heading(self):
+        text = '# Guide\n\nintro\n\nThe answer is 42.\n\nmore detail\n' + ''.join(
+            f'line {number}\n' for number in range(7, 21))
+        unit = self.unit('docs', {'guide.md': text})
+        self.backend.rows[unit['unit_id']] = [self.row(unit, 'guide.md', 1, 20)]
+        result = self.direct(unit).search('conceptual behaviour', limit=1, max_chars=1800)
+        hit = result['excerpts'][0]
+        self.assertIn('The answer is 42.', hit['text'])
+        self.assertEqual(hit['lines'][0], 1)
+        self.assertEqual(hit['text'], ''.join(text.splitlines(keepends=True)[hit['lines'][0]-1:hit['lines'][1]]))
+
+    def test_query_variants_are_searched_independently_and_fused(self):
+        unit = self.unit('variants', {'ru.c': 'int русский;\n', 'en.c': 'int technical;\n'})
+        ru = self.row(unit, 'ru.c', 1, 1)
+        en = self.row(unit, 'en.c', 1, 1)
+        def backend(unit_id, query, *, limit, paths):
+            self.backend.calls.append((unit_id, query, paths))
+            return [ru] if query == 'русский' else [en]
+        self.backend.search = backend
+        direct = self.direct(unit)
+        result = direct.search('русский', query_variants=['technical'], limit=2)
+        self.assertEqual({hit['path'] for hit in result['excerpts']}, {'ru.c', 'en.c'})
+        self.assertEqual({call[1] for call in self.backend.calls}, {'русский', 'technical'})
+        for value in ([], ['technical', 'other', 'third', 'fourth'], ['technical', ''],
+                      'technical', [1]):
+            with self.subTest(variants=value), self.assertRaises(SearchError):
+                direct.search('русский', query_variants=value)
+
+    def test_variant_top_result_is_admitted_before_primary_duplicates(self):
+        unit = self.unit('variant-priority', {'a.c': 'int first;\n', 'b.c': 'int second;\n',
+                                              'c.c': 'int technical;\n'})
+        rows = [self.row(unit, path, 1, 1) for path in ('a.c', 'b.c', 'c.c')]
+        def backend(unit_id, query, *, limit, paths):
+            return rows if query == 'primary' else [rows[2]]
+        self.backend.search = backend
+        result = self.direct(unit).search('primary', query_variants=['technical'], limit=1)
+        self.assertEqual([hit['path'] for hit in result['excerpts']], ['c.c'])
+
     def test_explicit_source_filter_wins_over_other_product_mentioned_with_same_path(self):
         alpha = self.unit('Alpha', {'src/main.c': '// signal alpha\n'})
         beta = self.unit('Beta', {'src/main.c': '// signal beta\n'})

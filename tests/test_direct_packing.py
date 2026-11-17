@@ -146,6 +146,16 @@ class DirectPackingTests(unittest.TestCase):
         self.assertLessEqual(len(json.dumps(result, ensure_ascii=False, separators=(',', ':'))), 1300)
         self.assert_exact_citations(direct, result, {('shared-parent', 'tests/check.c'): text})
 
+    def test_variant_top_markdown_section_keeps_its_full_answer_window(self):
+        text = '# Guide\n\n' + ''.join(f'line {number}\n' for number in range(2, 21))
+        unit = self.unit('variant-packing', {'guide.md': text})
+        row = self.row(unit, 'guide.md', 1, 21)
+        self.backend.search = lambda unit_id, query, *, limit, paths: [row] if query == 'technical' else []
+        direct = self.direct(unit)
+        result = direct.search('primary', query_variants=['technical'], limit=1, max_chars=1800)
+        self.assertIn('line 20', result['excerpts'][0]['text'])
+        self.assertEqual(result['excerpts'][0]['lines'], [1, 21])
+
     def test_explicit_large_read_is_never_replaced_by_a_smaller_window(self):
         text, _setup, _anchor = self.function(0)
         unit = self.unit('explicit', {'tests/check.c': text})
@@ -156,6 +166,21 @@ class DirectPackingTests(unittest.TestCase):
         self.assertEqual(result['excerpts'], [])
         self.assertTrue(result['truncated'])
         self.assertEqual(direct.resolve([]), [])
+
+    def test_omitted_explicit_read_suggests_a_smaller_executable_window(self):
+        text = ''.join(f'int line{number}; // ' + 'x' * 28 + '\n' for number in range(1, 121))
+        unit = self.unit('suggestions', {'main.c': text})
+        direct = self.direct(unit)
+        request = {'source_id': 'suggestions', 'path': 'main.c', 'start': 1, 'end': 120}
+        result = direct.read_many([request], max_chars=3000, include_catalog=False)
+        self.assertEqual(result['excerpts'], [])
+        self.assertEqual(result['omitted_count'], 1)
+        suggestion = result['omitted_reads'][0]
+        self.assertLess(suggestion['end'] - suggestion['start'] + 1, 120)
+        retried = direct.read_many([suggestion], max_chars=3000, include_catalog=False)
+        self.assertEqual(len(retried['excerpts']), 1)
+        self.assertEqual(retried['excerpts'][0]['lines'],
+                         [suggestion['start'], suggestion['end']])
 
     def test_indivisible_long_line_is_omitted_and_truncation_is_reported(self):
         text = 'const char *message = "' + 'q' * 3000 + '";\r\n'

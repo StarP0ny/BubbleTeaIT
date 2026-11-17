@@ -7,6 +7,9 @@ from .config import Config, ConfigError
 
 
 def build_server(config: Config, *, workspace: str | None = None):
+    if config.engines:
+        from .engine_mcp import build_engine_server
+        return build_engine_server(config, workspace)
     from pydantic import BaseModel, ConfigDict, Field
     from mcp.server.mcpserver import MCPServer
     from mcp.server.mcpserver.exceptions import ToolError
@@ -75,6 +78,7 @@ def build_server(config: Config, *, workspace: str | None = None):
         'composition_id pins a version and is optional for the configured project. '
         'Use freshness=wait after changing source files or bti.toml to wait for automatic indexing. '
         'Search excerpts are already citable; read again only to expand context. '
+        'For a non-English question, pass up to three English technical query_variants. '
         'Use list_sources/list_files only when discovery is needed. '
         'Read the original source before drawing conclusions. '
         'A retrieved test is not an executed test. Source roots cannot be added through search.'))
@@ -151,6 +155,7 @@ def build_server(config: Config, *, workspace: str | None = None):
     @server.tool(structured_output=True, annotations=project_read)
     @anticipated_errors
     def context_search(composition_id: str | None = None, query: str = '',
+                       query_variants: list[str] | None = None,
                        limit: Annotated[int, Field(strict=True, ge=1, le=8)] = 6,
                        max_chars: Annotated[int, Field(strict=True, ge=512, le=16000)] = 12000,
                        roles: list[str] | None = None, source_ids: list[str] | None = None,
@@ -161,12 +166,13 @@ def build_server(config: Config, *, workspace: str | None = None):
                        compositions: list[dict[str, str]] | None = None,
                        freshness: Literal['available', 'wait'] = 'available',
                        timeout_ms: Annotated[int, Field(strict=True, ge=0, le=60000)] = 30000) -> dict[str, Any]:
-        """Search the configured project directly; no discovery call is required. composition_id pins an exact version; workspace/projects select cross-project context. freshness=wait waits for automatic synchronization after source/config edits; updating/error contains no fresh search results. Returned original text and IDs are already citable; read_sources only expands context. roles/source_ids/paths are explicit filters, mentioning a path in query is not a filter. max_chars bounds compact JSON, coverage describes returned windows rather than selection completeness; next_read is ready to use, omitted_reads are suggestions, not evidence."""
+        """Search the configured project directly; no discovery call is required. composition_id pins an exact version; workspace/projects select cross-project context. freshness=wait waits for automatic synchronization after source/config edits; updating/error contains no fresh search results. Returned original text and IDs are already citable; read_sources only expands context. roles/source_ids/paths are explicit filters, mentioning a path in query is not a filter. query_variants optionally adds up to three independently searched formulations (for example English technical terms next to a Russian question) fused by RRF. max_chars bounds compact JSON, coverage describes returned windows rather than selection completeness; next_read is ready to use, omitted_reads are suggestions, not evidence."""
         if not query.strip():
             raise ConfigError('query must not be empty')
         return session.search(query, composition_id=composition_id, project=project, workspace=workspace,
             projects=projects, compositions=compositions, freshness=freshness, timeout_ms=timeout_ms,
             limit=limit, max_chars=max_chars, roles=roles, source_ids=source_ids, paths=paths,
+            query_variants=query_variants,
             include_catalog=(composition_id is not None if include_catalog is None else include_catalog))
 
     @server.tool(structured_output=True, annotations=project_read)

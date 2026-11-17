@@ -20,6 +20,12 @@ def add_commands(commands):
             item.add_argument('--debounce-ms', type=int)
             item.add_argument('--poll-interval-seconds', type=int)
             item.add_argument('--reconcile-interval-seconds', type=int)
+            item.add_argument('--embedding-model', help='Local model directory for coordinated CocoIndex Code')
+            item.add_argument('--embedding-revision', help='Exact model revision for a new index namespace')
+            item.add_argument('--embedding-device', choices=['cpu', 'cuda'])
+            item.add_argument('--embedding-python', help='Python runtime with stock CocoIndex Code and the selected device')
+            item.add_argument('--symbol-server', choices=['clangd', 'ccls'])
+            item.add_argument('--language-server', help='Executable path of the selected symbol server')
     config = actions.add_parser('config').add_subparsers(dest='config_action', required=True)
     config.add_parser('show').add_argument('--json', action='store_true')
     watch = commands.add_parser('watch', help='Постоянное наблюдение за проектом из bti.toml')
@@ -83,6 +89,11 @@ def output(value, as_json):
 
 
 def run(args, config):
+    from .engine_config import apply_engine_flags
+    config = apply_engine_flags(config, args)
+    if config.engines:
+        if getattr(args, 'embedding_profile', None):
+            raise ConfigError('For coordinated engines use --embedding-model/--embedding-revision or --config')
     config = select_profile(config, getattr(args, 'embedding_profile', None))
     overrides = {key: getattr(args, key) for key in ('debounce_ms', 'poll_interval_seconds', 'reconcile_interval_seconds')
                  if getattr(args, key, None) is not None}
@@ -99,7 +110,7 @@ def run(args, config):
             current = client.request('config')['settings']
             expected = config_payload(config)
             for key in ('data_dir', 'models', 'qwen', 'cocoindex', 'embedding_profile', 'embedding_override',
-                        'embedding_profiles', 'sync', 'sync_overrides', 'workspaces', 'service_file'):
+                        'embedding_profiles', 'sync', 'sync_overrides', 'workspaces', 'service_file', 'engines', 'projects', 'engine_overrides'):
                 if current.get(key) != expected.get(key):
                     raise ConfigError('Service already uses different settings; stop it before starting with overrides')
             value = client.request('status')
@@ -128,7 +139,11 @@ def run(args, config):
             raise ConfigError('-p and --project-dir select different directories')
         # Validate before starting a daemon, avoiding side effects on bad input.
         from .project import load_project
-        load_project(path / 'bti.toml')
+        if config.engines:
+            from .engine_projects import selected_project
+            selected_project(config, path)
+        else:
+            load_project(path / 'bti.toml')
         value = client.request('register', path=str(path))
         if args.follow:
             previous = None

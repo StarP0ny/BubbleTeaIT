@@ -26,7 +26,7 @@ async def probe(root: Path, composition: str, query: str, channel: str,
                 log_path: Path, *, timeout: float = 180):
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
-    args = ['-m', 'bubbleteait', '--project-dir', str(root), 'mcp']
+    args = ['-m', 'bubbleteait', '--project-dir', str(root), 'mcp', '--snapshots']
     params = StdioServerParameters(command=sys.executable, args=args, cwd=str(root),
         env=os.environ | {'PYTHONUTF8': '1', 'PYTHONIOENCODING': 'utf-8'})
     log_path.parent.mkdir(parents=True, exist_ok=True)

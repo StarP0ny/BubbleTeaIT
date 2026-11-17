@@ -75,7 +75,7 @@ class QwenConfigTests(unittest.TestCase):
         from bubbleteait.backends.qwen import QWEN_OPTIONS
         recipe = _recipe(self.config)
         self.assertEqual(recipe.backend, "qwen-dense")
-        self.assertEqual(recipe.chunker, "bti-lines-v1")
+        self.assertEqual(recipe.chunker, "bti-sections-v2")
         self.assertEqual(recipe.embedding_model, REPOSITORY)
         self.assertEqual(recipe.embedding_revision, REVISION)
         self.assertEqual(recipe.options, QWEN_OPTIONS)

@@ -1,5 +1,9 @@
 # Установка и запуск
 
+Для общего сервиса CocoIndex Code / Serena и нескольких проектов используйте
+[настройку координатора](engines.md). Инструкция ниже сохраняет установку
+прежнего режима снимков.
+
 Нужны Python 3.12+ и Git. Модельные веса и индексы в пакет не входят.
 
 ## Окружение
@@ -82,6 +86,24 @@ bti workspace status example
 снимки и регистрации. Подробности — в [service.md](service.md).
 
 ## MCP
+
+Для расширения Codex сохраните конфигурацию в `.codex/config.toml` внутри папки,
+которую открываете как доверенный проект. Например, для workspace `work`
+из [машинного конфига](../configs/config-service-engines.example.toml) и установленного
+в PATH `bti`:
+
+```toml
+[mcp_servers.bti]
+command = 'bti'
+args = ['--project-dir', 'C:/work/controller', 'mcp', '--workspace', 'work']
+```
+
+На Windows можно явно указать `python.exe` из окружения BTI и поставить
+`'-X', 'utf8', '-m', 'bubbleteait'` в начало `args`. Для другого проекта
+поменяйте имя workspace и каталог. Для нескольких папок одного workspace
+положите конфиг в каждую открываемую папку. Проверьте `codex mcp get bti`
+из этой папки, затем `project_info` в новой MCP-сессии. В ответе должны быть
+ожидаемые workspace и проекты.
 
 ```powershell
 .\.venv\Scripts\python.exe -X utf8 -m bubbleteait --project-dir C:/work/controller mcp

@@ -1,0 +1,54 @@
+# Machine config: replace paths with installed runtimes, local weights and projects.
+[service]
+data_dir = '${LOCALAPPDATA}/BubbleTeaIT'
+
+[paths]
+models_dir = 'E:/models'
+
+[engines.cocoindex]
+python_executable = 'C:/BTI/embedding-runtime/python.exe'
+model_path = 'E:/models/embeddings/Qwen/Qwen3-Embedding-0.6B'
+model_revision = 'REPLACE_WITH_EXACT_LOCAL_MODEL_REVISION'
+device = 'cuda'
+timeout_seconds = 600
+
+[engines.cocoindex.indexing_params]
+prompt_name = 'document'
+
+[engines.cocoindex.query_params]
+prompt_name = 'query'
+
+# Optional. Install BTI to create its language-server argument launcher.
+[engines.serena]
+executable = 'C:/BTI/serena-runtime/Scripts/serena.exe'
+python_executable = 'C:/BTI/.venv/Scripts/python.exe'
+server = 'clangd' # or ccls
+language_server = 'C:/tools/llvm/bin/clangd.exe'
+query_drivers = ['C:/toolchain/bin/target-gcc.exe']
+timeout_seconds = 120
+
+[projects.controller]
+path = 'C:/work/controller'
+project_file = 'C:/work/controller/bti.toml'
+description = 'Основной проект'
+compile_commands = 'build/compile_commands.json'
+
+# A sibling need not contain bti.toml. Selection may be machine-owned.
+[projects.reference]
+path = 'C:/work/reference'
+include = ['src/**/*.c', 'include/**/*.h']
+exclude = ['**/tests/**']
+description = 'Реализация для сравнения'
+# attach = ['src', 'include'] # explicit override of ignore, when needed
+
+[workspaces.work]
+path = 'C:/work'
+projects = ['controller', 'reference']
+default_project = 'controller'
+watch = true
+
+[sync]
+enabled = true
+debounce_ms = 2000
+poll_interval_seconds = 10
+reconcile_interval_seconds = 60

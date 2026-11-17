@@ -63,7 +63,7 @@ def config_payload(config):
     """Only coordinator settings; credentials and non-service configuration are not exported."""
     keys = ('project_dir', 'data_dir', 'models_dir', 'models', 'loaded_files', 'cocoindex',
             'qwen', 'symbols', 'project_config', 'service_file', 'sync', 'workspaces', 'embedding_profile',
-            'embedding_override', 'sync_overrides', 'embedding_profiles', 'origins')
+            'embedding_override', 'sync_overrides', 'embedding_profiles', 'origins', 'engines', 'projects', 'engine_overrides')
     raw = asdict(config)
     return json.loads(json.dumps({k: raw[k] for k in keys}, default=str))
 
@@ -85,6 +85,12 @@ def config_from_payload(raw):
         item['path'] = Path(item['path'])
     for item in raw.get('embedding_profiles', {}).values():
         item['model_path'] = Path(item['model_path'])
+    for item in raw.get('projects', {}).values():
+        for key in ('path', 'project_file', 'compile_commands'):
+            if key in item:
+                item[key] = Path(item[key])
+    if 'cocoindex' in raw.get('engines', {}):
+        raw['engines']['cocoindex']['model_path'] = Path(raw['engines']['cocoindex']['model_path'])
     return Config(**raw)
 
 
@@ -629,7 +635,9 @@ class ServiceClient:
             data=json.dumps({'action': action, **payload}, allow_nan=False).encode(),
             headers={'Authorization': 'Bearer ' + state['token'], 'Content-Type': 'application/json'})
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
-        with opener.open(request, timeout=65 if action == 'select' else 5) as response:
+        timeout = (max((e.get('timeout_seconds', 600) for e in self.config.engines.values()), default=600) + 65
+                   if action == 'engine' else 65 if action == 'select' else 5)
+        with opener.open(request, timeout=timeout) as response:
             value = json.loads(response.read(8 * 1024 * 1024))
         if not value.get('ok'):
             raise ConfigError(value.get('error', 'Service request failed'))
@@ -661,7 +669,7 @@ class ServiceClient:
             # race where the new service died immediately.
             if os.name == 'nt':
                 from .qwen_windows import spawn_worker
-                spawn_worker(sys.executable, Path(__file__).resolve().parents[2] / 'tools/service_worker.py',
+                spawn_worker(sys.executable, Path(__file__).resolve().parent / '_workers/service_worker.py',
                              launch, self.config.data_dir)
             else:
                 environment = os.environ.copy()

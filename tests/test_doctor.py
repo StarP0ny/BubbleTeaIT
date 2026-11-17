@@ -20,6 +20,8 @@ class DoctorTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.addCleanup(self.temp.cleanup)
         self.enterContext(patch.dict(os.environ, {key: value for key, value in os.environ.items() if key not in {"BTI_DATA_DIR", "BTI_MODELS_DIR"}}, clear=True))
+        self.enterContext(patch.dict(os.environ, {'LOCALAPPDATA': str(self.root/'user-appdata'),
+                                                 'XDG_CONFIG_HOME': str(self.root/'user-config')}))
         self.config = Config(self.root, self.root / "data", self.root / "models")
 
     def test_offline_check_does_not_create_directories_or_contact_services(self):

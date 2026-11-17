@@ -144,8 +144,6 @@ class QwenRuntimeClient:
                 atomic_json(launch, config)
                 environment = os.environ | {'PYTHONIOENCODING': 'utf-8', 'PYTHONUTF8': '1',
                     'HF_HUB_OFFLINE': '1', 'TRANSFORMERS_OFFLINE': '1', 'HF_DATASETS_OFFLINE': '1'}
-                source = str(Path(__file__).resolve().parents[1])
-                environment['PYTHONPATH'] = source + (os.pathsep + environment['PYTHONPATH'] if environment.get('PYTHONPATH') else '')
                 process = self._spawn(launch, environment)
             deadline = time.monotonic() + min(self.timeout_seconds, 30)
             while time.monotonic() < deadline:
@@ -158,16 +156,16 @@ class QwenRuntimeClient:
             raise QwenRuntimeError('Worker startup timed out; inspect runtime/qwen/worker.log')
 
     def _spawn(self, launch, environment):
+        launcher = Path(__file__).resolve().parent / '_workers/qwen_worker.py'
         if os.name == 'nt':
             from .qwen_windows import spawn_worker
-            launcher = Path(__file__).resolve().parents[2] / 'tools' / 'qwen_worker.py'
             try:
                 spawn_worker(self.python_executable, launcher, launch, self.data_dir)
             except (OSError, ValueError, subprocess.SubprocessError) as exc:
                 raise QwenRuntimeError(str(exc)) from exc
             return None  # Readiness/identity timeout bounds the WMI-owned process.
         with (self.runtime_dir / 'worker.log').open('ab') as log:
-            return subprocess.Popen([str(self.python_executable), '-m', 'bubbleteait.qwen_worker', '--config', str(launch)],
+            return subprocess.Popen([str(self.python_executable), str(launcher), '--config', str(launch)],
                 stdin=subprocess.DEVNULL, stdout=log, stderr=log, cwd=self.data_dir, env=environment, start_new_session=True)
 
     def request(self, action, **payload):
