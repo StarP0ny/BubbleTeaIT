@@ -142,6 +142,15 @@ Qwen3-Embedding-0.6B; замена строки `model_path` не делает �
 
 ## Проверки
 
+В режиме снимков `search --channel text` ищет по UTF-8-файлам выбранных источников
+с учётом фильтра путей. Поле `skipped_files` перечисляет файлы с ошибкой декодирования
+даже при пустой выдаче. Для каждого указаны `reason=non_utf8`, `source_id`, `unit_id`,
+`file_path` и `source_sha256`.
+
+Каждая найденная строка получает по две строки контекста с каждой стороны в пределах файла.
+Пересекающиеся диапазоны одного файла объединяются до применения `limit`.
+Оценка диапазона равна наибольшему числу разных терминов запроса на одной строке.
+
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 .\.venv\Scripts\python.exe -X utf8 tools/probe_mcp.py --composition <id> --query "<query>" --channel text --output .local/mcp-check.json

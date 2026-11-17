@@ -19,7 +19,8 @@ import shutil
 import subprocess
 import tempfile
 
-from ..registry import Registry
+from ..registry import Registry, RegistryError
+from ..snapshot_evidence import verify_worker_results
 from .base import BackendCapabilities
 
 
@@ -242,29 +243,10 @@ class CocoIndexBackend:
                 raise BackendError("Index is missing, busy, stale or belongs to different model files")
             self._stage(manifest, root)
             response = self._run({"action": "search", "recipe": manifest["recipe"], "query": query, "limit": limit, "paths": paths}, root)
-            entries = {entry["path"]: entry for entry in manifest["files"]}
-            results = []
-            rows = response.get("results")
-            if not isinstance(rows, list) or len(rows) > limit:
-                raise BackendError("Worker returned an invalid results list")
-            for row in rows:
-                if not isinstance(row, dict) or not {"file_path", "start_line", "end_line", "content", "score"} <= row.keys() or not isinstance(row["file_path"], str) or not isinstance(row["content"], str):
-                    raise BackendError("Worker returned a malformed search result")
-                relative = row["file_path"].replace("\\", "/")
-                entry = entries.get(relative)
-                if entry is None:
-                    raise BackendError("Search result is outside the snapshot whitelist")
-                source = self.data_dir / "sources" / unit_id / "files" / relative
-                lines = source.read_text(encoding="utf-8").splitlines(keepends=True)
-                start, end = row["start_line"], row["end_line"]
-                if type(start) is not int or type(end) is not int or not 1 <= start <= end <= len(lines):
-                    raise BackendError("Search result has invalid source coordinates")
-                content = row["content"].replace("\r\n", "\n")
-                if not content.strip() or content.strip() not in "".join(lines[start-1:end]).strip():
-                    raise BackendError("Search content does not match its source coordinates")
-                if isinstance(row["score"], bool) or not isinstance(row["score"], (int, float)) or not math.isfinite(row["score"]):
-                    raise BackendError("Search result has invalid score")
-                results.append({**row, "file_path": relative, "unit_id": unit_id, "source_id": manifest["source_id"],
-                                "source_sha256": entry["sha256"], "recipe_hash": manifest["recipe_hash"], "backend": "cocoindex-code"})
+            try:
+                rows = verify_worker_results(self.data_dir, manifest, response.get("results"), limit, paths,
+                                             native_paths=True)
+            except RegistryError as exc:
+                raise BackendError(str(exc)) from exc
             self.registry.load_unit(unit_id, verify_files=True)
-            return results
+            return [{**row, "backend": "cocoindex-code"} for row in rows]

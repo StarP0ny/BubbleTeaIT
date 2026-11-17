@@ -2,8 +2,10 @@ from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
+import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from bubbleteait.registry import IndexRecipe, Registry, RegistryError, SourceSpec
 from bubbleteait.search import SearchError, SearchService
@@ -141,6 +143,41 @@ class SearchTests(unittest.TestCase):
         # SQL GLOB '*' includes directory separators, as CocoIndex does.
         self.assertEqual(len(self.service.search("product", "exactSymbol", channel="text", paths=["*.c"])["results"]), 2)
 
+    def test_text_reports_undecodable_files_only_inside_the_search_scope(self):
+        self.unit(content=b"unrelated\n")
+        (self.root / "sensor" / "legacy.c").write_bytes(b"\xff")
+        manifest = self.registry.snapshot("sensor", self.recipe)
+        self.status(manifest)
+        foreign = self.unit("other", content=b"\xfe")
+        self.compose(manifest, foreign)
+        options = dict(channel="text", source_ids=["sensor"])
+        result = self.service.search("product", "unrelated", **options)
+        skipped = {"source_id": "sensor", "unit_id": manifest["unit_id"], "file_path": "legacy.c",
+                   "source_sha256": hashlib.sha256(b"\xff").hexdigest(), "reason": "non_utf8"}
+        self.assertEqual(result["skipped_files"], [skipped])
+        self.assertEqual([row["file_path"] for row in result["results"]], ["sensor.c"])
+        only_bad = self.service.search("product", "missing", paths=["legacy.c"], **options)
+        self.assertEqual(only_bad["results"], [])
+        self.assertEqual(only_bad["skipped_files"], [skipped])
+        only_good = self.service.search("product", "missing", paths=["sensor.c"], **options)
+        self.assertEqual(only_good["skipped_files"], [])
+
+    def test_text_merges_overlapping_windows_before_topk_and_preserves_best_line_score(self):
+        lines = [f"line {i}\n" for i in range(1, 21)]
+        for number, line in [(1, "heat\n"), (4, "heat trip\n"), (8, "heat trip\n"), (15, "trip\n")]:
+            lines[number - 1] = line
+        self.unit(filename="a.c", content="".join(lines).encode())
+        (self.root / "sensor/b.c").write_bytes(b"heat trip\n")
+        manifest = self.registry.snapshot("sensor", self.recipe)
+        self.status(manifest)
+        self.compose(manifest)
+        found = self.service.search("product", "heat trip", channel="text", limit=2)["results"]
+        self.assertEqual([(r["file_path"], r["start_line"], r["end_line"], r["score"]) for r in found],
+                         [("a.c", 1, 10, 2), ("b.c", 1, 1, 2)])
+        self.assertEqual(found[0]["content"], "".join(lines[:10]))
+        separated = self.service.search("product", "heat trip", channel="text", paths=["a.c"])["results"]
+        self.assertEqual([(r["start_line"], r["end_line"]) for r in separated], [(1, 10), (13, 17)])
+
     def test_source_read_checks_whitelist_coordinates_and_current_working_hash(self):
         content = b"line one\r\nint sensorError = 7;\r\nline three\n"
         manifest = self.unit(content=content)
@@ -247,6 +284,27 @@ class SearchTests(unittest.TestCase):
             "content": "one\n", "score": 0.5}]})
         with self.assertRaisesRegex(SearchError, "match source coordinates"):
             SearchService(self.registry.data_dir, backend).search("product", "one")
+
+    def test_qwen_search_verifies_worker_response_against_requested_snapshot(self):
+        from bubbleteait.backends.qwen import QwenBackend, default_recipe
+        from bubbleteait.qwen_runtime import QwenRuntimeError
+
+        manifest = self.unit(recipe=default_recipe(), content=b"one\r\ntwo\r\n")
+        backend = QwenBackend(self.registry.data_dir, sys.executable, self.root / "model", models_dir=self.root)
+        row = self.row("one\ntwo", score=1.0) | {"end_line": 2}
+        with patch.object(backend.client, "_probe", return_value={"worker_running": True}), \
+             patch.object(backend.client, "_call", return_value={"results": [row]}) as rpc:
+            result = backend.search(manifest["unit_id"], "one")[0]
+            self.assertEqual(result["source_sha256"], manifest["files"][0]["sha256"])
+            self.assertEqual(result["content"], "one\r\ntwo\r\n")
+            for change in ({"content": "two"}, {"unit_id": "wrong"}, {"start_line": True},
+                           {"recipe_hash": "wrong"}, {"score": float("nan")}):
+                rpc.return_value = {"results": [row | change]}
+                with self.subTest(change=change), self.assertRaises(QwenRuntimeError):
+                    backend.search(manifest["unit_id"], "one")
+            rpc.return_value = {"results": [row]}
+            with self.assertRaisesRegex(QwenRuntimeError, "path filter"):
+                backend.search(manifest["unit_id"], "one", paths=["*.h"])
 
     def test_composition_source_root_must_match_registered_source(self):
         manifest = self.unit()

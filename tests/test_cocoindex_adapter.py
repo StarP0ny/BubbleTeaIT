@@ -97,6 +97,12 @@ class CocoIndexAdapterTests(unittest.TestCase):
             with self.subTest(row=row), self.assertRaises(BackendError):
                 self.search(row)
 
+    def test_worker_cannot_cite_two_lines_with_only_one_or_claim_a_foreign_sha(self):
+        self.index()
+        for row in [self.row(content=self.text.splitlines()[0]), self.row(source_sha256="0" * 64)]:
+            with self.subTest(row=row), self.assertRaises(BackendError):
+                self.search(row)
+
     def test_wrong_model_revision_never_launches_worker(self):
         path = self.model / "bti-model-manifest.json"
         value = json.loads(path.read_text())

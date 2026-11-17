@@ -2,27 +2,22 @@
 
 Qwen exact cosine scores share a global ranking only for identical recipes.
 Other federated output interleaves per-unit ranks in composition order; it
-never sorts scores from different models together. The text channel ranks
-matching lines by substring counts, not BM25. Path filters use SQLite GLOB.
+never sorts scores from different models together. The text channel merges
+overlapping windows and ranks them by their best line's query-term coverage.
+Path filters use SQLite GLOB.
 """
 
 from __future__ import annotations
 
 from contextlib import closing
-import hashlib
 import json
-import math
 from pathlib import Path
 import re
 import sqlite3
-import stat
 from typing import Any, Sequence
 
+from .snapshot_evidence import SearchError, _bytes, _path_matches, _text, snapshot_file, verify_result
 from .registry import Registry, RegistryError, _digest, _identifier, _relative, _safe_file
-
-
-class SearchError(RegistryError):
-    """Composition, filter, source or backend response is not usable."""
 
 
 def _filter_values(values: Sequence[str] | None, label: str) -> list[str] | None:
@@ -31,36 +26,6 @@ def _filter_values(values: Sequence[str] | None, label: str) -> list[str] | None
     if not isinstance(values, (list, tuple)) or any(not isinstance(value, str) or not value for value in values):
         raise SearchError(f"{label} must be an array of nonempty strings")
     return list(values)
-
-
-def _path_matches(connection: sqlite3.Connection, path: str, patterns: list[str] | None) -> bool:
-    return patterns is None or any(connection.execute("SELECT ? GLOB ?", (path, pattern)).fetchone()[0] for pattern in patterns)
-
-
-def _bytes(path: Path, expected_hash: str | None = None) -> tuple[bytes, str]:
-    try:
-        before = path.stat()
-        if not stat.S_ISREG(before.st_mode):
-            raise SearchError("Source path is not a regular file")
-        content = path.read_bytes()
-        after = path.stat()
-    except OSError as exc:
-        raise SearchError(f"Source file is unavailable: {path}") from exc
-    if (before.st_size, before.st_mtime_ns, before.st_ino) != (after.st_size, after.st_mtime_ns, after.st_ino):
-        raise SearchError("Source changed while it was being read; retry")
-    if len(content) != after.st_size:
-        raise SearchError("Source size changed while it was being read; retry")
-    digest = hashlib.sha256(content).hexdigest()
-    if expected_hash is not None and digest != expected_hash:
-        raise SearchError("Snapshot source hash does not match its manifest")
-    return content, digest
-
-
-def _text(content: bytes) -> str:
-    try:
-        return content.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise SearchError("Source is not UTF-8; an explicit decoding adapter is required") from exc
 
 
 class SearchService:
@@ -130,60 +95,46 @@ class SearchService:
         return composition
 
     def _snapshot_file(self, manifest: dict, relative: str) -> tuple[dict, bytes, str]:
-        _relative(relative)
-        entry = next((entry for entry in manifest["files"] if entry["path"] == relative), None)
-        if entry is None:
-            raise SearchError("Requested source file is outside the snapshot whitelist")
-        root = self.data_dir / "sources" / manifest["unit_id"] / "files"
-        content, digest = _bytes(_safe_file(root, relative), entry["sha256"])
-        return entry, content, digest
+        return snapshot_file(self.data_dir, manifest, relative)
 
     def _decorate(self, manifest: dict, row: dict, rank: int) -> dict:
-        if not isinstance(row, dict) or not {"file_path", "start_line", "end_line", "content"} <= row.keys() or not isinstance(row["content"], str):
-            raise SearchError("Backend returned an invalid source result")
-        if "score" in row and (isinstance(row["score"], bool) or not isinstance(row["score"], (int, float)) or not math.isfinite(row["score"])):
-            raise SearchError("Backend result score must be a finite number")
-        entry, content, _ = self._snapshot_file(manifest, row["file_path"])
-        lines = _text(content).splitlines(keepends=True) or [""]
-        start, end = row["start_line"], row["end_line"]
-        if type(start) is not int or type(end) is not int or not 1 <= start <= end <= len(lines):
-            raise SearchError("Backend result has invalid source coordinates")
-        excerpt = "".join(lines[start - 1:end]).replace("\r\n", "\n")
-        candidate = row["content"].replace("\r\n", "\n")
-        # The backend row must be the exact source slice, not merely a
-        # substring of it. Otherwise a row could cite lines it never returned.
-        if not candidate.strip() or not (candidate == excerpt or candidate + "\n" == excerpt or candidate == excerpt + "\n"):
-            raise SearchError("Backend result content does not match source coordinates")
+        verified = verify_result(self.data_dir, manifest, row)
         return {
-            **row, "content": excerpt, "unit_id": manifest["unit_id"], "source_id": manifest["source_id"],
-            "source_sha256": entry["sha256"], "recipe_hash": manifest["recipe_hash"],
+            **verified, "content": verified["content"].replace("\r\n", "\n"),
             "role": manifest["role"], "kind": manifest["kind"],
             "provenance": manifest["provenance"], "unit_rank": rank,
         }
 
-    def _text_rows(self, manifest: dict, query: str, limit: int, paths: list[str] | None, connection: sqlite3.Connection) -> list[dict]:
+    def _text_rows(self, manifest: dict, query: str, limit: int, paths: list[str] | None,
+                   connection: sqlite3.Connection) -> tuple[list[dict], list[dict]]:
         terms = set(re.findall(r"\w+", query.casefold()))
         if not terms:
             raise SearchError("Text query must contain an identifier or word")
         candidates = []
+        skipped = []
         for entry in manifest["files"]:
             if not _path_matches(connection, entry["path"], paths):
                 continue
             _, content, _ = self._snapshot_file(manifest, entry["path"])
             try:
-                lines = _text(content).splitlines(keepends=True)
-            except SearchError:
-                continue  # Binary/non-UTF8 files need a separate parsing recipe.
-            seen_ranges = set()
+                lines = content.decode("utf-8").splitlines(keepends=True)
+            except UnicodeDecodeError:
+                skipped.append({"unit_id": manifest["unit_id"], "source_id": manifest["source_id"],
+                                "file_path": entry["path"], "source_sha256": entry["sha256"], "reason": "non_utf8"})
+                continue
+            windows = []
             for index, line in enumerate(lines):
                 folded = line.casefold()
                 hits = sum(term in folded for term in terms)
                 if not hits:
                     continue
                 start, end = max(1, index - 1), min(len(lines), index + 3)
-                if (start, end) in seen_ranges:
-                    continue
-                seen_ranges.add((start, end))
+                if windows and start <= windows[-1][1]:
+                    first, _, best = windows[-1]
+                    windows[-1] = first, end, max(best, hits)
+                else:
+                    windows.append((start, end, hits))
+            for start, end, hits in windows:
                 candidates.append({
                     "file_path": entry["path"], "start_line": start, "end_line": end,
                     "content": "".join(lines[start - 1:end]), "score": hits,
@@ -191,7 +142,7 @@ class SearchService:
                     "backend": "snapshot-text",
                 })
         candidates.sort(key=lambda row: (-row["score"], row["file_path"], row["start_line"], row["end_line"]))
-        return candidates[:limit]
+        return candidates[:limit], skipped
 
     def search(self, composition_id: str, query: str, *, limit: int = 10, channel: str = "vector", roles: Sequence[str] | None = None, source_ids: Sequence[str] | None = None, paths: Sequence[str] | None = None) -> dict:
         """Search selected units, preserving their recipe and per-unit ranking."""
@@ -211,6 +162,7 @@ class SearchService:
             if (roles is None or manifest["role"] in roles) and (source_ids is None or manifest["source_id"] in source_ids):
                 selected.append(manifest)
         groups = []
+        skipped_files = []
         with closing(sqlite3.connect(":memory:")) as connection:
             for manifest in selected:
                 if paths == [] or (paths is not None and not any(_path_matches(connection, entry["path"], paths) for entry in manifest["files"])):
@@ -220,7 +172,8 @@ class SearchService:
                         raise SearchError("Vector search requires an explicitly configured backend")
                     rows = self.backend.search(manifest["unit_id"], query, limit=limit, paths=paths)
                 else:
-                    rows = self._text_rows(manifest, query, limit, paths, connection)
+                    rows, skipped = self._text_rows(manifest, query, limit, paths, connection)
+                    skipped_files.extend(skipped)
                 if not isinstance(rows, list) or len(rows) > limit:
                     raise SearchError("Backend returned an invalid result list")
                 group = []
@@ -263,6 +216,7 @@ class SearchService:
             "composition_hash": composition["composition_hash"], "channel": channel,
             "ranking": "global_cosine_same_recipe" if comparable else "per_unit_rank_interleave",
             "scores_comparable_across_units": comparable,
+            **({"skipped_files": skipped_files} if channel == "text" else {}),
             "selected_units": [manifest["unit_id"] for manifest in selected], "results": results,
         }
 

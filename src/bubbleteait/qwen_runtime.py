@@ -15,6 +15,8 @@ import urllib.error
 import urllib.request
 
 from .qwen_encoder import profile_hash
+from .registry import Registry, RegistryError
+from .snapshot_evidence import verify_worker_results
 
 
 class QwenRuntimeError(ValueError):
@@ -177,4 +179,12 @@ class QwenRuntimeClient:
             return {'ok': True, 'worker_running': False, 'resident': False, 'ready': False, 'identity': self.identity}
         if action == 'health' and health:
             return health
-        return self._call(state if health else self._start(), action, payload)
+        response = self._call(state if health else self._start(), action, payload)
+        if action == 'search':
+            try:
+                manifest = Registry(self.data_dir).load_unit(payload['unit_id'], verify_files=False)
+                response['results'] = verify_worker_results(self.data_dir, manifest, response.get('results'),
+                    payload.get('limit', 10), payload.get('paths'))
+            except RegistryError as exc:
+                raise QwenRuntimeError(str(exc)) from exc
+        return response

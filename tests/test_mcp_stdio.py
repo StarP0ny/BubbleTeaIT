@@ -27,6 +27,7 @@ class MCPStdioTests(unittest.IsolatedAsyncioTestCase):
             (root / '.local/config.toml').write_text(
                 '[backends.cocoindex]\npython_executable="missing-bti-runtime-python-12345"\n', encoding='utf-8')
             (source / 'control.c').write_text('int heatingAllowed(int trip) {\n    return trip == 0;\n}\n', encoding='utf-8')
+            (source / 'legacy.c').write_bytes(b'\xff')
             registry = Registry(root / 'data')
             registry.register(SourceSpec('fixture', 'module', source, include=('**/*.c',)))
             unit = registry.snapshot('fixture', IndexRecipe('text-fixture', 'none', 'none', 'lines'))
@@ -41,7 +42,10 @@ class MCPStdioTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(result['traversal_rejected'])
             self.assertEqual(result['tools'], ['code_symbols', 'context_search', 'index_status', 'list_files', 'list_sources', 'project_info', 'read_source', 'read_sources',
                                                'resolve_sources', 'search', 'sync_project', 'sync_status', 'watch_status'])
-            found = result['search']['structuredContent']['results']
+            search = result['search']['structuredContent']
+            self.assertEqual([(f['file_path'], f['reason']) for f in search['skipped_files']],
+                             [('legacy.c', 'non_utf8')])
+            found = search['results']
             self.assertEqual(found[0]['unit_id'], unit['unit_id'])
             self.assertIn('heatingAllowed', found[0]['content'])
 
