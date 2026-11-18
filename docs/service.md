@@ -197,6 +197,10 @@ Watch=true включает постоянное наблюдение. Watch=fal
 Этот раздел описывает режим снимков. При `mode=coordinated-live` используйте
 [контракт live MCP](engines.md#cli-и-mcp) с `generation`, SHA и `next_read`.
 
+`index_status(unit_id)` проверяет идентичность манифеста и читает состояние индекса.
+Чтобы дополнительно сверить размер и SHA каждого файла снимка, передайте
+`verify_sources=true`. В CLI этому соответствует `bti status --unit <unit_id> --verify-sources`.
+
 Проектное подключение совместимо с прежней командой:
 
 ```powershell

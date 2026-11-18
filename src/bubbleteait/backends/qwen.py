@@ -342,7 +342,7 @@ class QwenIndexStore:
         if artifact.is_symlink() or not artifact.resolve().is_relative_to(root):
             raise BackendError('Index artifact escapes unit directory')
         try:
-            status = self.registry.index_status(manifest['unit_id'])
+            status = self.registry.index_status(manifest['unit_id'], verify_sources=True)
             metadata = json.loads((artifact / 'manifest.json').read_text(encoding='utf-8'))
             state = status.get('status')
             if (require_ready and state != 'ready') or state not in ('ready', 'building', 'error', 'missing'):

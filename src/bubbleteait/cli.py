@@ -74,7 +74,7 @@ def _source_command(args, config):
         return registry.compose(args.composition_id, args.unit, configuration=configuration,
                                 require_ready=not args.draft)
     if args.command == "status":
-        return registry.index_status(args.unit)
+        return registry.index_status(args.unit, verify_sources=args.verify_sources)
     if args.command == "symbols":
         import asyncio
         from .symbols import SymbolService
@@ -154,8 +154,9 @@ def main(argv: list[str] | None = None) -> int:
     compose.add_argument("--configuration", help="JSON object with product/configuration context")
     compose.add_argument("--draft", action="store_true", help="Save unready references as a draft")
     compose.add_argument("--json", action="store_true")
-    status = commands.add_parser("status", help="Validate a snapshot and its backend status")
+    status = commands.add_parser("status", help="Validate the manifest and report backend status")
     status.add_argument("--unit", required=True)
+    status.add_argument("--verify-sources", action="store_true", help="Also verify every snapshot file against its SHA")
     status.add_argument("--json", action="store_true")
     search = commands.add_parser("search", help="Retrieve context from an exact ready composition")
     search.add_argument("query")

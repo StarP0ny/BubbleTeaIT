@@ -67,6 +67,11 @@ class SourceCLITests(unittest.TestCase):
             code, draft = run('compose', 'release', '--unit', unit['unit_id'], '--draft')
             self.assertEqual(code, 0)
             self.assertFalse(draft['ready'])
+            (root / 'data/sources' / unit['unit_id'] / 'files/main.c').write_bytes(b'changed')
+            self.assertEqual(run('status', '--unit', unit['unit_id'])[0], 0)
+            code, damaged = run('status', '--unit', unit['unit_id'], '--verify-sources')
+            self.assertNotEqual(code, 0)
+            self.assertIn('bytes do not match', str(damaged))
 
 
 if __name__ == '__main__':

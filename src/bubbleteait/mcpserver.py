@@ -113,9 +113,9 @@ def build_server(config: Config, *, workspace: str | None = None):
 
     @server.tool(structured_output=True, annotations=read_only)
     @anticipated_errors
-    def index_status(unit_id: str) -> dict[str, Any]:
-        """Validate a unit's snapshot identity, recipe and current index status."""
-        return registry.index_status(unit_id)
+    def index_status(unit_id: str, verify_sources: bool = False) -> dict[str, Any]:
+        """Validate manifest identity, recipe and index status. Set verify_sources to audit every snapshot file."""
+        return registry.index_status(unit_id, verify_sources=verify_sources)
 
     @server.tool(structured_output=True, annotations=project_read)
     @anticipated_errors

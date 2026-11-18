@@ -1,6 +1,7 @@
 from dataclasses import replace
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -240,6 +241,61 @@ class RegistryTests(unittest.TestCase):
             self.registry.load_unit(manifest["unit_id"])
         with self.assertRaises(RegistryError):
             self.snapshot()
+
+    def test_index_status_uses_only_metadata_and_rechecks_manifest_on_change(self):
+        self.write("main.c")
+        self.register()
+        manifest = self.snapshot()
+        uid = manifest["unit_id"]
+        self.status(manifest)
+        root = self.registry.data_dir / "sources" / uid
+        (root / "files/main.c").unlink()
+        with patch.object(Path, "lstat", autospec=True, side_effect=Path.lstat) as stats:
+            self.assertEqual(self.registry.index_status(uid)["status"], "ready")
+        self.assertFalse(any(call.args[0].is_relative_to(root / "files") for call in stats.call_args_list))
+        with self.assertRaises(RegistryError):
+            self.registry.index_status(uid, verify_sources=True)
+        self.status(manifest, recipe_hash="wrong")
+        with self.assertRaisesRegex(RegistryError, "status does not match"):
+            self.registry.index_status(uid)
+        manifest["files"][0]["size"] += 1
+        (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        with self.assertRaisesRegex(RegistryError, "content hash"):
+            self.registry.index_status(uid)
+
+    def test_warm_manifest_cannot_mask_same_size_damage_with_restored_mtime(self):
+        self.write("nested/main.c", b"original")
+        self.register()
+        uid = self.snapshot()["unit_id"]
+        manifest = self.registry.load_unit(uid)
+        manifest["files"].clear()
+        self.assertEqual(len(self.registry.load_unit(uid)["files"]), 1)
+        copied = self.registry.data_dir / "sources" / uid / "files/nested/main.c"
+        before = copied.stat()
+        copied.write_bytes(b"tampered")
+        os.utime(copied, ns=(before.st_atime_ns, before.st_mtime_ns))
+        with self.assertRaisesRegex(RegistryError, "bytes do not match"):
+            self.registry.load_unit(uid)
+
+    def test_warm_manifest_rechecks_linked_parent_before_read(self):
+        self.write("nested/main.c")
+        self.register()
+        uid = self.snapshot()["unit_id"]
+        self.registry.load_unit(uid)
+        nested = self.registry.data_dir / "sources" / uid / "files/nested"
+        nested.rename(nested.with_name("moved"))
+        try:
+            nested.symlink_to(nested.with_name("moved"), target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("Symlink creation not permitted on this host")
+        with patch("bubbleteait.registry._read_file", side_effect=AssertionError("followed link")):
+            with self.assertRaisesRegex(RegistryError, "symlink"):
+                self.registry.load_unit(uid)
+        files = nested.parent
+        files.rename(files.with_name("saved"))
+        files.symlink_to(files, target_is_directory=True)
+        with self.assertRaisesRegex(RegistryError, "symlink"):
+            self.registry.load_unit(uid)
 
     def test_tampered_manifest_traversal_is_rejected_even_without_byte_verification(self):
         self.write("main.c")

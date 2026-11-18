@@ -21,6 +21,7 @@ the coordinator's writer lock (planned in the update layer).
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from fnmatch import fnmatchcase
@@ -241,24 +242,40 @@ def _checked_spec(spec: SourceSpec) -> SourceSpec:
                       tuple(tuple(group) for group in spec.include_groups))
 
 
-def _safe_file(root: Path, relative: str) -> Path:
-    if root.is_symlink() or (hasattr(root, "is_junction") and root.is_junction()):
-        raise RegistryError("File root must not be a symlink/junction")
-    path = root / _relative(relative)
+def _checked_path(root: Path, relative: str, resolved_root: Path | None = None) -> tuple[Path, os.stat_result | None]:
+    """Return a confined path and, for an existing snapshot file, its pre-read stat."""
+    relative = _relative(relative)
     # Reject links in every component; resolving only the final file misses a
-    # linked parent directory. This also prevents crafted snapshot manifests.
+    # linked parent directory. Strict snapshot scans know every path must exist.
     current = root
-    for part in PurePosixPath(relative).parts:
-        current = current / part
-        if current.is_symlink() or (hasattr(current, "is_junction") and current.is_junction()):
+    info = None
+    for part in ("", *relative.split("/")):
+        if part:
+            current = current / part
+        if resolved_root is not None:
+            info = current.lstat()
+            linked = stat.S_ISLNK(info.st_mode) or (
+                os.name == "nt" and info.st_reparse_tag == stat.IO_REPARSE_TAG_MOUNT_POINT)
+        else:
+            linked = current.is_symlink() or (hasattr(current, "is_junction") and current.is_junction())
+        if linked:
             raise RegistryError(f"Selected symlink/junction is not supported: {relative}")
-    if not path.resolve().is_relative_to(root.resolve()):
+    if not current.resolve(strict=resolved_root is not None).is_relative_to(resolved_root or root.resolve()):
         raise RegistryError(f"Selected path escapes source root: {relative}")
+    if os.name == "nt" and info is not None and info.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+        # Other reparse points can have different lstat and followed stat data.
+        info = None
+    return current, info
+
+
+def _safe_file(root: Path, relative: str) -> Path:
+    path, _ = _checked_path(root, relative)
     return path
 
 
-def _read_file(path: Path) -> tuple[bytes, dict]:
-    before = path.stat()
+def _read_file(path: Path, *, before: os.stat_result | None = None) -> tuple[bytes, dict]:
+    if before is None:
+        before = path.stat()
     if not stat.S_ISREG(before.st_mode):
         raise RegistryError(f"Selected path is not a regular file: {path}")
     content = path.read_bytes()
@@ -474,6 +491,9 @@ class Registry:
     def __init__(self, data_dir: Path | str):
         self.data_dir = Path(data_dir).resolve()
         self.sources_file = self.data_dir / "metadata/sources.json"
+        # Store only proof of metadata validation. Callers receive fresh JSON
+        # objects, and no cached digest vouches for the current source bytes.
+        self._verified_manifests: deque[tuple[str, bytes]] = deque(maxlen=64)
 
     def _sources(self) -> dict:
         if not self.sources_file.exists():
@@ -663,13 +683,22 @@ class Registry:
             return self.load_unit(unit_id, verify_files=True)
         return manifest
 
-    def load_unit(self, unit_id: str, *, verify_files: bool = True) -> dict:
-        """Validate manifest identity and optionally every snapshot byte."""
+    def _load_manifest(self, unit_id: str) -> dict:
         _unit_identifier(unit_id)
         root = self.data_dir / "sources" / unit_id
         if root.is_symlink() or (hasattr(root, "is_junction") and root.is_junction()):
             raise RegistryError("Snapshot root must not be a symlink")
-        manifest = _json(root / "manifest.json")
+        path = root / "manifest.json"
+        try:
+            raw = path.read_bytes()
+            manifest = json.loads(raw.decode("utf-8"))
+        except (OSError, ValueError) as exc:
+            raise RegistryError(f"Cannot read metadata: {path}") from exc
+        if not isinstance(manifest, dict):
+            raise RegistryError(f"Expected JSON object: {path}")
+        key = unit_id, hashlib.sha256(raw).digest()
+        if key in self._verified_manifests:
+            return manifest
         if manifest.get("schema_version") != 1 or manifest.get("unit_id") != unit_id or manifest.get("snapshot_ready") is not True:
             raise RegistryError("Snapshot manifest is not ready or has invalid identity")
         recipe_hash = _digest(manifest.get("recipe"))
@@ -688,14 +717,6 @@ class Registry:
             seen.add(relative)
             if not isinstance(entry["sha256"], str) or not _HASH.fullmatch(entry["sha256"]) or type(entry["size"]) is not int or entry["size"] < 0:
                 raise RegistryError("Invalid snapshot file hash or size")
-            path = _safe_file(root / "files", relative)
-            if verify_files:
-                try:
-                    _, actual = _read_file(path)
-                except OSError as exc:
-                    raise RegistryError(f"Snapshot file is unavailable: {relative}") from exc
-                if actual != {"sha256": entry["sha256"], "size": entry["size"]}:
-                    raise RegistryError(f"Snapshot bytes do not match: {relative}")
         if entries != sorted(entries, key=lambda item: item["path"]):
             raise RegistryError("Snapshot file list is not canonical")
         if manifest.get("content_hash") != _digest(entries):
@@ -703,11 +724,33 @@ class Registry:
         identity = {key: manifest.get(key) for key in ("source_id", "kind", "role", "content_hash", "recipe_hash")}
         if "u-" + _digest(identity) != unit_id:
             raise RegistryError("Snapshot unit identity does not match manifest")
+        self._verified_manifests.append(key)
         return manifest
 
-    def index_status(self, unit_id: str, *, verify_sources: bool = True) -> dict:
-        """Validate a backend status record against the immutable source recipe."""
-        manifest = self.load_unit(unit_id, verify_files=verify_sources)
+    def load_unit(self, unit_id: str, *, verify_files: bool = True) -> dict:
+        """Validate manifest identity, path boundaries and optionally every byte."""
+        manifest = self._load_manifest(unit_id)
+        root = self.data_dir / "sources" / unit_id / "files"
+        try:
+            resolved = root.resolve() if verify_files else None
+        except (OSError, RuntimeError) as exc:
+            # Python 3.12 reports a symlink loop as RuntimeError.
+            raise RegistryError("Snapshot file root is unavailable or has a symlink loop") from exc
+        for entry in manifest["files"]:
+            relative = entry["path"]
+            try:
+                path, before = _checked_path(root, relative, resolved)
+                if verify_files:
+                    _, actual = _read_file(path, before=before)
+                    if actual["sha256"] != entry["sha256"] or actual["size"] != entry["size"]:
+                        raise RegistryError(f"Snapshot bytes do not match: {relative}")
+            except OSError as exc:
+                raise RegistryError(f"Snapshot file is unavailable: {relative}") from exc
+        return manifest
+
+    def index_status(self, unit_id: str, *, verify_sources: bool = False) -> dict:
+        """Read index metadata. Explicit source verification also audits the snapshot bytes."""
+        manifest = self.load_unit(unit_id) if verify_sources else self._load_manifest(unit_id)
         return self._status_for_manifest(manifest)
 
     def _status_for_manifest(self, manifest: dict) -> dict:

@@ -238,7 +238,7 @@ class CocoIndexBackend:
             raise BackendError("paths filters must stay within the snapshot")
         manifest, root, model_hash = self._context(unit_id)
         with _unit_lock(root / "writer.lock"):
-            status = self.registry.index_status(unit_id)
+            status = self.registry.index_status(unit_id, verify_sources=True)
             if status.get("status") != "ready" or status.get("model_manifest_sha256") != model_hash:
                 raise BackendError("Index is missing, busy, stale or belongs to different model files")
             self._stage(manifest, root)
