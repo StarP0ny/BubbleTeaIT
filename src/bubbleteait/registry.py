@@ -708,6 +708,11 @@ class Registry:
     def index_status(self, unit_id: str, *, verify_sources: bool = True) -> dict:
         """Validate a backend status record against the immutable source recipe."""
         manifest = self.load_unit(unit_id, verify_files=verify_sources)
+        return self._status_for_manifest(manifest)
+
+    def _status_for_manifest(self, manifest: dict) -> dict:
+        """Read the current status for an already validated manifest."""
+        unit_id = manifest["unit_id"]
         path = self.data_dir / "indexes" / unit_id / "status.json"
         if not path.exists():
             return {"unit_id": unit_id, "status": "missing", "recipe_hash": manifest["recipe_hash"]}
@@ -741,7 +746,7 @@ class Registry:
         source_ids = [unit["source_id"] for unit in units]
         if len(set(source_ids)) != len(source_ids):
             raise RegistryError("A composition must select one exact version per logical source")
-        states = [self.index_status(unit["unit_id"]) for unit in units]
+        states = [self._status_for_manifest(unit) for unit in units]
         all_ready = all(state["status"] == "ready" for state in states)
         if require_ready and not all_ready:
             raise RegistryError("Composition cannot be published: some indexes are not ready")

@@ -44,6 +44,10 @@ class SearchService:
 
     def load_composition(self, composition_id: str) -> dict:
         """Validate fingerprints, exact refs and current readiness of all units."""
+        composition, _ = self._validated_composition(composition_id)
+        return composition
+
+    def _validated_composition(self, composition_id: str) -> tuple[dict, dict[str, dict]]:
         _identifier(composition_id, "composition_id")
         path = _safe_file(self.data_dir, f"metadata/compositions/{composition_id}.json")
         try:
@@ -75,7 +79,7 @@ class SearchService:
             seen_units.add(reference["unit_id"])
             seen_sources.add(reference["source_id"])
             units_by_source[reference["source_id"]] = manifest
-            if reference["index_status"] != "ready" or self.registry.index_status(reference["unit_id"])["status"] != "ready":
+            if reference["index_status"] != "ready" or self.registry._status_for_manifest(manifest)["status"] != "ready":
                 raise SearchError("Composition index is no longer ready")
         # A composition is data. Its working-read root must identify the same
         # source directory as the immutable unit, not an arbitrary path.
@@ -92,13 +96,13 @@ class SearchService:
         fingerprint = _digest({"units": [{"unit_id": ref["unit_id"], "recipe_hash": ref["recipe_hash"]} for ref in refs], "configuration_hash": composition["configuration_hash"]})
         if composition.get("composition_hash") != fingerprint:
             raise SearchError("Composition fingerprint does not match its unit references")
-        return composition
+        return composition, {unit["unit_id"]: unit for unit in units_by_source.values()}
 
     def _snapshot_file(self, manifest: dict, relative: str) -> tuple[dict, bytes, str]:
         return snapshot_file(self.data_dir, manifest, relative)
 
-    def _decorate(self, manifest: dict, row: dict, rank: int) -> dict:
-        verified = verify_result(self.data_dir, manifest, row)
+    def _decorate(self, manifest: dict, row: dict, rank: int, files: dict) -> dict:
+        verified = verify_result(self.data_dir, manifest, row, files)
         return {
             **verified, "content": verified["content"].replace("\r\n", "\n"),
             "role": manifest["role"], "kind": manifest["kind"],
@@ -155,12 +159,9 @@ class SearchService:
         paths = _filter_values(paths, "paths")
         for pattern in paths or []:
             _relative(pattern)
-        composition = self.load_composition(composition_id)
-        selected = []
-        for reference in composition["units"]:
-            manifest = self.registry.load_unit(reference["unit_id"])
-            if (roles is None or manifest["role"] in roles) and (source_ids is None or manifest["source_id"] in source_ids):
-                selected.append(manifest)
+        composition, units = self._validated_composition(composition_id)
+        selected = [unit for unit in units.values() if (roles is None or unit["role"] in roles)
+                    and (source_ids is None or unit["source_id"] in source_ids)]
         groups = []
         skipped_files = []
         with closing(sqlite3.connect(":memory:")) as connection:
@@ -177,8 +178,9 @@ class SearchService:
                 if not isinstance(rows, list) or len(rows) > limit:
                     raise SearchError("Backend returned an invalid result list")
                 group = []
+                files = {}
                 for rank, row in enumerate(rows, start=1):
-                    decorated = self._decorate(manifest, row, rank)
+                    decorated = self._decorate(manifest, row, rank, files)
                     if not _path_matches(connection, decorated["file_path"], paths):
                         raise SearchError("Backend violated its pre-retrieval path filter")
                     group.append(decorated)
@@ -233,10 +235,14 @@ class SearchService:
             raise SearchError("Read mode must be snapshot or working")
         if type(start_line) is not int or start_line < 1 or (end_line is not None and (type(end_line) is not int or end_line < start_line)):
             raise SearchError("Source coordinates must be positive inclusive line numbers")
-        manifest = self.registry.load_unit(unit_id)
-        composition = self.load_composition(composition_id) if composition_id is not None else None
-        if composition is not None and not any(ref["unit_id"] == unit_id for ref in composition["units"]):
-            raise SearchError("Requested unit does not belong to this composition")
+        composition = None
+        if composition_id is None:
+            manifest = self.registry.load_unit(unit_id)
+        else:
+            composition, units = self._validated_composition(composition_id)
+            if not isinstance(unit_id, str) or unit_id not in units:
+                raise SearchError("Requested unit does not belong to this composition")
+            manifest = units[unit_id]
         entry, snapshot_bytes, snapshot_hash = self._snapshot_file(manifest, file_path)
         root_value = None
         if composition is not None:

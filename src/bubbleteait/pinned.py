@@ -13,7 +13,7 @@ class PinnedSearchService(SearchService):
         self.pinned = copy.deepcopy(composition)
         self.load_composition(self.pinned['composition_id'])
 
-    def load_composition(self, composition_id):
+    def _validated_composition(self, composition_id):
         c = self.pinned
         if composition_id != c['composition_id'] or c.get('ready') is not True or c.get('schema_version') != 1:
             raise SearchError('Pinned search requires a pinned ready composition')
@@ -25,11 +25,13 @@ class PinnedSearchService(SearchService):
         if c.get('composition_hash') != fingerprint or not refs:
             raise SearchError('Pinned composition fingerprint differs')
         seen = set()
+        units = {}
         for r in refs:
             u = self.registry.load_unit(r['unit_id'])
             if u['source_id'] in seen or r['source_id'] != u['source_id'] or r['recipe_hash'] != u['recipe_hash']:
                 raise SearchError('Pinned unit identity differs')
             seen.add(u['source_id'])
-            if r['index_status'] != 'ready' or self.registry.index_status(r['unit_id'])['status'] != 'ready':
+            if r['index_status'] != 'ready' or self.registry._status_for_manifest(u)['status'] != 'ready':
                 raise SearchError('Pinned index is no longer ready')
-        return copy.deepcopy(c)
+            units[r['unit_id']] = u
+        return copy.deepcopy(c), units

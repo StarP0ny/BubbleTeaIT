@@ -55,7 +55,7 @@ def snapshot_file(data_dir: Path, manifest: dict, relative: str) -> tuple[dict, 
     return entry, content, digest
 
 
-def verify_result(data_dir: Path, manifest: dict, row: dict) -> dict:
+def verify_result(data_dir: Path, manifest: dict, row: dict, files: dict | None = None) -> dict:
     """Return the original snapshot slice and reject contradictory evidence."""
     if (not isinstance(row, dict) or not {"file_path", "start_line", "end_line", "content"} <= row.keys()
             or not isinstance(row["file_path"], str) or not isinstance(row["content"], str)):
@@ -64,12 +64,18 @@ def verify_result(data_dir: Path, manifest: dict, row: dict) -> dict:
         score = row["score"]
         if type(score) not in (int, float) or not -sys.float_info.max <= score <= sys.float_info.max:
             raise SearchError("Backend result score must be a finite number")
-    _, raw, digest = snapshot_file(data_dir, manifest, row["file_path"])
+    key = (manifest["unit_id"], row["file_path"])
+    if files is not None and key in files:
+        lines, digest = files[key]
+    else:
+        _, raw, digest = snapshot_file(data_dir, manifest, row["file_path"])
+        lines = _text(raw).splitlines(keepends=True)
+        if files is not None:
+            files[key] = lines, digest
     proof = {key: manifest[key] for key in ("unit_id", "source_id", "recipe_hash")}
     proof["source_sha256"] = digest
     if any(key in row and row[key] != value for key, value in proof.items()):
         raise SearchError("Backend result source identity differs from the snapshot")
-    lines = _text(raw).splitlines(keepends=True)
     start, end = row["start_line"], row["end_line"]
     if type(start) is not int or type(end) is not int or not 1 <= start <= end <= len(lines):
         raise SearchError("Backend result has invalid source coordinates")
@@ -86,13 +92,14 @@ def verify_worker_results(data_dir: Path, manifest: dict, rows, limit: int, path
     if not isinstance(rows, list) or len(rows) > limit:
         raise SearchError("Worker returned an invalid result list")
     verified = []
+    files = {}
     with closing(sqlite3.connect(":memory:")) as connection:
         for row in rows:
             if not isinstance(row, dict) or "score" not in row:
                 raise SearchError("Worker returned an unscored result")
             if native_paths and isinstance(row.get("file_path"), str):
                 row = {**row, "file_path": row["file_path"].replace("\\", "/")}
-            value = verify_result(data_dir, manifest, row)
+            value = verify_result(data_dir, manifest, row, files)
             if not _path_matches(connection, value["file_path"], paths):
                 raise SearchError("Backend violated its pre-retrieval path filter")
             verified.append(value)

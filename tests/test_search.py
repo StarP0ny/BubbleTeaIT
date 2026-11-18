@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from bubbleteait.registry import IndexRecipe, Registry, RegistryError, SourceSpec
 from bubbleteait.search import SearchError, SearchService
+from bubbleteait import registry, snapshot_evidence
 
 
 class FakeBackend:
@@ -275,6 +276,32 @@ class SearchTests(unittest.TestCase):
         backend.search = change_composition
         with self.assertRaisesRegex(SearchError, "changed during retrieval"):
             SearchService(self.registry.data_dir, backend).search("product", "sensor")
+
+    def test_search_checks_each_unit_at_entry_and_exit_and_reads_one_file_for_all_hits(self):
+        first, second = self.unit("first"), self.unit("second")
+        self.compose(first, second)
+        backend = FakeBackend({unit["unit_id"]: [self.row(), self.row()] for unit in (first, second)})
+        service = SearchService(self.registry.data_dir, backend)
+        with patch.object(registry, "_read_file", wraps=registry._read_file) as full_reads, \
+             patch.object(snapshot_evidence, "_bytes", wraps=snapshot_evidence._bytes) as evidence_reads:
+            rows = service.search("product", "sensor", limit=4)["results"]
+            self.assertEqual(len(rows), 4)
+            self.assertEqual((full_reads.call_count, evidence_reads.call_count), (4, 2))
+            full_reads.reset_mock()
+            service.read_source(first["unit_id"], "sensor.c", composition_id="product")
+            self.assertEqual(full_reads.call_count, 2)
+
+    def test_snapshot_search_detects_damage_to_unselected_unit_during_retrieval(self):
+        first, second = self.unit("first"), self.unit("second")
+        self.compose(first, second)
+        path = self.registry.data_dir / "sources" / second["unit_id"] / "files/sensor.c"
+        backend = FakeBackend({})
+        def change_unselected(*args, **kwargs):
+            path.write_bytes(b"int different;\n")
+            return [self.row()]
+        backend.search = change_unselected
+        with self.assertRaisesRegex(RegistryError, "bytes do not match"):
+            SearchService(self.registry.data_dir, backend).search("product", "sensor", source_ids=["first"])
 
     def test_backend_content_must_be_exact_slice_not_substring_of_range(self):
         manifest = self.unit(content=b"one\ntwo\nthree\n")

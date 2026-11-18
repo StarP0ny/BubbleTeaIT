@@ -273,16 +273,19 @@ class _PinnedSearch(SearchService):
         if isinstance(backend, (ConfiguredBackend, _LazyBackend)):
             backend.registry = self.registry
         self.request_lock, self._depth = threading.RLock(), 0
-        self.pinned = super().load_composition(composition_id)
+        self.pinned, _ = super()._validated_composition(composition_id)
 
     def _validate(self):
         started = time.perf_counter()
         try:
+            units = {}
             for ref in self.pinned['units']:
                 unit = self.registry.load_unit(ref['unit_id'])
                 if (unit['source_id'] != ref['source_id'] or unit['recipe_hash'] != ref['recipe_hash']
-                        or self.registry.index_status(ref['unit_id'])['status'] != 'ready'):
+                        or self.registry._status_for_manifest(unit)['status'] != 'ready'):
                     raise SearchError('Pinned direct composition is no longer ready')
+                units[unit['unit_id']] = unit
+            return units
         finally:
             self.validation_seconds = getattr(self, 'validation_seconds', 0.0) + time.perf_counter() - started
             self.validation_calls = getattr(self, 'validation_calls', 0) + 1
@@ -307,13 +310,15 @@ class _PinnedSearch(SearchService):
                 if outer:
                     self.registry.manifests = None
 
-    def load_composition(self, composition_id):
+    def _validated_composition(self, composition_id):
         if composition_id != self.pinned['composition_id']:
             raise SearchError('Direct retrieval is pinned to one composition')
         with self.request_lock:
-            if not self._depth:
-                self._validate()
-        return copy.deepcopy(self.pinned)
+            if self._depth:
+                units = {ref['unit_id']: self.registry.manifests[ref['unit_id']] for ref in self.pinned['units']}
+            else:
+                units = self._validate()
+            return copy.deepcopy(self.pinned), units
 
 
 class DirectService:
@@ -450,8 +455,9 @@ class DirectService:
                 score /= 1 + max(0, len(line) - 160) / 640
                 candidates.append((score, unit, path, number, line))
         candidates.sort(key=lambda row: (-row[0], row[1]['unit_id'], row[2], row[3]))
+        files = {}
         return [self.service._decorate(unit, {'file_path': path, 'start_line': number, 'end_line': number,
-            'content': line, 'score': score}, rank) for rank, (score, unit, path, number, line)
+            'content': line, 'score': score}, rank, files) for rank, (score, unit, path, number, line)
                 in enumerate(candidates[:limit], 1)]
 
     @_timed('report_routing')
@@ -483,8 +489,9 @@ class DirectService:
                 found = self.service.backend.search(unit['unit_id'], query, limit=limit, paths=literals)
                 if not isinstance(found, list) or len(found) > limit:
                     raise SearchError('Routed report backend returned an invalid result list')
+                files = {}
                 for rank, row in enumerate(found, 1):
-                    value = self.service._decorate(unit, row, rank)
+                    value = self.service._decorate(unit, row, rank, files)
                     if value['file_path'] not in allowed:
                         raise SearchError('Routed report backend violated its exact path filter')
                     rows.append(value)
